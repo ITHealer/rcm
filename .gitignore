@@ -1,0 +1,6 @@
+dataset/
+.venv/
+.python-version
+uv.lock
+models/
+*.sql

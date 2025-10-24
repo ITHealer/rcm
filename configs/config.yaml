@@ -1,0 +1,316 @@
+# ============================================================================
+# MAIN CONFIGURATION
+# ============================================================================
+# Complete configuration for recommendation system
+# Merged from offline, online, and redis configs
+
+# ============================================================================
+# SYSTEM
+# ============================================================================
+system:
+  name: "recommendation-system"
+  version: "1.0.0"
+  environment: "development"  # development, staging, production
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+
+# ============================================================================
+# DATA
+# ============================================================================
+data:
+  # Data source
+  source: "csv"  # csv or database
+  dir: "dataset"
+  
+  # CSV files
+  csv_files:
+    users: "User.csv"
+    posts: "Post.csv"
+    reactions: "PostReaction.csv"
+    friendships: "Friendship.csv"
+  
+  # Database (if source = "database")
+  database:
+    host: "localhost"
+    port: 5432
+    database: "social_network"
+    user: "postgres"
+    password: "password"
+  
+  # Data processing
+  lookback_days: 90
+  chunk_size: 100000
+  
+  # Train/test split
+  train_test_split:
+    test_days: 7
+    val_days: 7
+
+# ============================================================================
+# TIME DECAY
+# ============================================================================
+time_decay:
+  enabled: true
+  half_life_days: 7.0  # Interactions lose 50% weight after 7 days
+  min_weight: 0.01     # Minimum weight (1% of original)
+
+# ============================================================================
+# EMBEDDINGS
+# ============================================================================
+embeddings:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  embedding_dim: 384
+  batch_size: 512
+  normalize: true
+  device: "auto"  # auto, cuda, cpu
+
+# ============================================================================
+# COLLABORATIVE FILTERING
+# ============================================================================
+collaborative_filtering:
+  min_interactions: 5
+  top_k_similar: 50
+  similarity_metric: "cosine"
+
+# ============================================================================
+# RANKING MODEL
+# ============================================================================
+ranking_model:
+  algorithm: "lightgbm"
+  
+  # LightGBM hyperparameters
+  params:
+    boosting_type: "gbdt"
+    objective: "binary"
+    metric: "auc"
+    num_leaves: 31
+    max_depth: 6
+    learning_rate: 0.05
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    lambda_l1: 0.1
+    lambda_l2: 0.1
+    min_data_in_leaf: 20
+    verbose: -1
+    n_jobs: -1
+    seed: 42
+  
+  # Training
+  num_boost_round: 1000
+  early_stopping_rounds: 50
+
+# ============================================================================
+# FEATURES
+# ============================================================================
+features:
+  # Feature categories
+  user_features: 15
+  post_features: 18
+  author_features: 7
+  interaction_features: 7
+  total_features: 47
+
+# ============================================================================
+# ONLINE INFERENCE
+# ============================================================================
+online:
+  # Recall
+  recall:
+    target_count: 1000
+    channels:
+      following:
+        enabled: true
+        count: 400
+        weight: 0.40
+      
+      collaborative_filtering:
+        enabled: true
+        count: 300
+        weight: 0.30
+      
+      content_based:
+        enabled: true
+        count: 200
+        weight: 0.20
+      
+      trending:
+        enabled: true
+        count: 100
+        weight: 0.10
+  
+  # Ranking
+  ranking:
+    top_k: 100
+    use_scaler: true
+  
+  # Re-ranking
+  reranking:
+    diversity:
+      enabled: true
+      max_same_author: 2
+    
+    freshness:
+      enabled: true
+      boost_hours: 24
+      boost_factor: 1.5
+    
+    quality:
+      enabled: true
+      min_engagement: 0.01
+  
+  # Final output
+  output:
+    limit: 50
+    min_score: 0.0
+
+# ============================================================================
+# REDIS
+# ============================================================================
+redis:
+  host: "localhost"
+  port: 6380
+  db: 0
+  password: null
+  
+  # Connection pool
+  max_connections: 50
+  
+  # TTL (seconds)
+  ttl:
+    embedding_user: 604800      # 7 days
+    embedding_post: 2592000     # 30 days
+    cf_similarity: 604800       # 7 days
+    user_stats: 86400           # 24 hours
+    author_stats: 86400         # 24 hours
+    following_feed: 172800      # 48 hours
+    trending_1h: 3600           # 1 hour
+    trending_6h: 21600          # 6 hours
+    trending_24h: 86400         # 24 hours
+    user_interactions: 2592000  # 30 days
+
+# ============================================================================
+# API
+# ============================================================================
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  reload: false
+  
+  # CORS
+  cors:
+    enabled: true
+    origins:
+      - "http://localhost:3000"
+      - "http://localhost:8080"
+  
+  # Rate limiting
+  rate_limit:
+    enabled: true
+    requests_per_minute: 60
+
+# ============================================================================
+# MODELS & ARTIFACTS
+# ============================================================================
+models:
+  dir: "models"
+  keep_last_n_versions: 5
+  
+  # Artifacts to save
+  artifacts:
+    - "embeddings.pkl"
+    - "faiss_index.bin"
+    - "faiss_post_ids.pkl"
+    - "cf_model.pkl"
+    - "ranking_model.txt"
+    - "ranking_scaler.pkl"
+    - "ranking_feature_cols.pkl"
+    - "user_stats.pkl"
+    - "author_stats.pkl"
+    - "following_dict.pkl"
+    - "metadata.json"
+
+# ============================================================================
+# BATCH JOBS
+# ============================================================================
+batch_jobs:
+  # Post embeddings (every 6 hours)
+  post_embeddings:
+    enabled: true
+    schedule: "0 */6 * * *"  # Cron: 00:00, 06:00, 12:00, 18:00
+    lookback_hours: 6
+  
+  # Full retraining (weekly)
+  full_training:
+    enabled: true
+    schedule: "0 2 * * 0"  # Cron: Sunday 2 AM
+  
+  # Trending update (every 15 min)
+  trending_update:
+    enabled: true
+    schedule: "*/15 * * * *"
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+logging:
+  dir: "logs"
+  
+  files:
+    offline: "offline_training.log"
+    online: "online_inference.log"
+    cache: "cache_updates.log"
+    api: "api.log"
+  
+  format: "[%(asctime)s] %(levelname)s - %(name)s - %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+
+# ============================================================================
+# MONITORING
+# ============================================================================
+monitoring:
+  enabled: true
+  
+  # Metrics to track
+  metrics:
+    - "request_latency"
+    - "cache_hit_rate"
+    - "model_accuracy"
+    - "throughput"
+  
+  # Alerting
+  alerts:
+    latency_threshold_ms: 200
+    error_rate_threshold: 0.05
+    cache_hit_rate_threshold: 0.90
+
+# ============================================================================
+# PERFORMANCE
+# ============================================================================
+performance:
+  # Latency targets (milliseconds)
+  latency_targets:
+    recall: 50
+    feature_extraction: 60
+    ranking: 30
+    reranking: 10
+    total: 200
+  
+  # Throughput targets
+  throughput_target: 100  # requests per second
+  
+  # Cache hit rate target
+  cache_hit_rate_target: 0.95
+
+# ============================================================================
+# DOCKER
+# ============================================================================
+docker:
+  registry: "localhost:5000"
+  
+  images:
+    offline: "recommendation-offline:latest"
+    online: "recommendation-online:latest"
+  
+  replicas:
+    online_api: 4

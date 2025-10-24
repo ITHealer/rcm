@@ -1,0 +1,128 @@
+# ============================================================================
+# OFFLINE TRAINING CONFIGURATION
+# ============================================================================
+# Configuration specifically for offline training pipeline
+
+# Data loading
+data:
+  dir: "dataset"
+  lookback_days: 90
+  chunk_size: 100000
+  
+  train_test_split:
+    test_days: 7
+    val_days: 7
+    method: "temporal"  # temporal or random
+
+# Time decay weighting
+time_decay:
+  enabled: true
+  half_life_days: 7.0
+  min_weight: 0.01
+  apply_to:
+    - "ranking_model"  # Apply to ranking model training
+
+# Embeddings generation
+embeddings:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  embedding_dim: 384
+  batch_size: 512
+  normalize: true
+  device: "auto"
+  
+  # Use raw data (no time decay)
+  use_raw_data: true
+
+# Collaborative Filtering
+collaborative_filtering:
+  min_interactions: 5
+  top_k_similar: 50
+  
+  # Use raw data (no time decay)
+  use_raw_data: true
+  
+  # Similarity computation
+  similarity_metric: "cosine"
+  dense_output: false  # Use sparse matrices
+
+# Faiss index
+faiss:
+  index_type: "IndexFlatIP"  # Inner Product for cosine similarity
+  normalize_vectors: true
+  use_gpu: false
+
+# Ranking model training
+ranking_model:
+  algorithm: "lightgbm"
+  
+  # Use weighted data (with time decay)
+  use_weighted_data: true
+  
+  # Hyperparameters
+  params:
+    boosting_type: "gbdt"
+    objective: "binary"
+    metric: "auc"
+    num_leaves: 31
+    max_depth: 6
+    learning_rate: 0.05
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    lambda_l1: 0.1
+    lambda_l2: 0.1
+    min_data_in_leaf: 20
+    verbose: -1
+    n_jobs: -1
+    seed: 42
+  
+  # Training
+  num_boost_round: 1000
+  early_stopping_rounds: 50
+  
+  # Feature engineering
+  features:
+    user: 15
+    post: 18
+    author: 7
+    interaction: 7
+
+# Model artifacts
+output:
+  models_dir: "models"
+  keep_last_n_versions: 5
+  
+  artifacts:
+    - "embeddings.pkl"
+    - "faiss_index.bin"
+    - "faiss_post_ids.pkl"
+    - "cf_model.pkl"
+    - "ranking_model.txt"
+    - "ranking_scaler.pkl"
+    - "ranking_feature_cols.pkl"
+    - "user_stats.pkl"
+    - "author_stats.pkl"
+    - "following_dict.pkl"
+    - "metadata.json"
+
+# MLflow tracking (optional)
+mlflow:
+  enabled: false
+  tracking_uri: "http://localhost:5000"
+  experiment_name: "recommendation_training"
+
+# Evaluation metrics
+evaluation:
+  metrics:
+    - "auc"
+    - "precision@10"
+    - "precision@20"
+    - "precision@50"
+    - "recall@50"
+    - "ndcg@10"
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/offline_training.log"
+  format: "[%(asctime)s] %(levelname)s - %(message)s"
