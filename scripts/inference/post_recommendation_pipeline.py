@@ -57,7 +57,7 @@ class PostRecommendationPipeline:
         )
         
         # Initialize feature engineer
-        from feature_engineer_fixed import FeatureEngineer
+        from recommender.common.feature_engineer import FeatureEngineer
         self.feature_engineer = FeatureEngineer(
             data=self.data,
             user_stats=self.user_stats,

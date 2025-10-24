@@ -1,62 +1,101 @@
 # ============================================================================
 # OFFLINE TRAINING CONFIGURATION
 # ============================================================================
-# Configuration specifically for offline training pipeline
+# Configuration for offline model training pipeline
 
-# Data loading
+# ============================================================================
+# SYSTEM
+# ============================================================================
+system:
+  name: "recommendation-offline-training"
+  version: "1.0.0"
+  environment: "development"
+  log_level: "INFO"
+
+# ============================================================================
+# DATA
+# ============================================================================
 data:
+  source: "csv"  # csv or database
   dir: "dataset"
-  lookback_days: 90
-  chunk_size: 100000
   
+  # CSV files
+  csv_files:
+    users: "User.csv"
+    posts: "Post.csv"
+    reactions: "PostReaction.csv"
+    friendships: "Friendship.csv"
+  
+  # Database (if source = "database")
+  database:
+    host: "localhost"
+    port: 5432
+    database: "social_network"
+    user: "postgres"
+    password: "${DB_PASSWORD}"
+  
+  # Data window
+  lookback_days: 14  # Use last 14 days for training
+  chunk_size: 100000  # For memory-efficient processing
+  
+  # Train/val/test split
   train_test_split:
     test_days: 7
     val_days: 7
-    method: "temporal"  # temporal or random
 
-# Time decay weighting
+# ============================================================================
+# TIME DECAY
+# ============================================================================
 time_decay:
   enabled: true
-  half_life_days: 7.0
-  min_weight: 0.01
-  apply_to:
-    - "ranking_model"  # Apply to ranking model training
+  half_life_days: 7.0  # Interactions lose 50% weight after 7 days
+  min_weight: 0.01     # Minimum weight threshold
+  
+  # Action multipliers
+  action_multipliers:
+    view: 0.5
+    like: 1.0
+    comment: 1.5
+    share: 2.0
+    save: 1.2
+    hide: -3.0
+    report: -5.0
 
-# Embeddings generation
+# ============================================================================
+# EMBEDDINGS GENERATION
+# ============================================================================
 embeddings:
   model_name: "sentence-transformers/all-MiniLM-L6-v2"
   embedding_dim: 384
   batch_size: 512
   normalize: true
-  device: "auto"
+  device: "auto"  # auto, cuda, cpu
   
-  # Use raw data (no time decay)
-  use_raw_data: true
+  # Post embeddings
+  post:
+    update_frequency: "6h"  # Update every 6 hours
+    min_content_length: 10  # Min characters
+  
+  # User embeddings
+  user:
+    lookback_days: 14  # Aggregate from last 14 days
+    min_interactions: 5  # Min interactions needed
+    update_frequency: "daily"
 
-# Collaborative Filtering
+# ============================================================================
+# COLLABORATIVE FILTERING
+# ============================================================================
 collaborative_filtering:
   min_interactions: 5
-  top_k_similar: 50
-  
-  # Use raw data (no time decay)
-  use_raw_data: true
-  
-  # Similarity computation
+  top_k_similar_users: 50
+  top_k_similar_items: 50
   similarity_metric: "cosine"
-  dense_output: false  # Use sparse matrices
 
-# Faiss index
-faiss:
-  index_type: "IndexFlatIP"  # Inner Product for cosine similarity
-  normalize_vectors: true
-  use_gpu: false
-
-# Ranking model training
+# ============================================================================
+# RANKING MODEL (LightGBM)
+# ============================================================================
 ranking_model:
   algorithm: "lightgbm"
-  
-  # Use weighted data (with time decay)
-  use_weighted_data: true
   
   # Hyperparameters
   params:
@@ -80,49 +119,132 @@ ranking_model:
   num_boost_round: 1000
   early_stopping_rounds: 50
   
-  # Feature engineering
-  features:
-    user: 15
-    post: 18
-    author: 7
-    interaction: 7
+  # Negative sampling
+  negative_sample_ratio: 5  # 5 negative for 1 positive
 
-# Model artifacts
-output:
-  models_dir: "models"
-  keep_last_n_versions: 5
+# ============================================================================
+# FEATURES
+# ============================================================================
+features:
+  user_features: 15
+  post_features: 18
+  author_features: 7
+  interaction_features: 7
+  total_features: 47
+
+# ============================================================================
+# ARTIFACT MANAGEMENT
+# ============================================================================
+artifacts:
+  base_dir: "models"
+  keep_versions: 5  # Keep last 5 versions
   
-  artifacts:
-    - "embeddings.pkl"
-    - "faiss_index.bin"
-    - "faiss_post_ids.pkl"
-    - "cf_model.pkl"
-    - "ranking_model.txt"
-    - "ranking_scaler.pkl"
-    - "ranking_feature_cols.pkl"
-    - "user_stats.pkl"
-    - "author_stats.pkl"
-    - "following_dict.pkl"
-    - "metadata.json"
+  # What to save
+  save:
+    - embeddings
+    - cf_model
+    - ranking_model
+    - ranking_scaler
+    - ranking_feature_cols
+    - user_stats
+    - author_stats
+    - following_dict
+    - faiss_index
+    - metadata
 
-# MLflow tracking (optional)
-mlflow:
-  enabled: false
-  tracking_uri: "http://localhost:5000"
-  experiment_name: "recommendation_training"
+# ============================================================================
+# TRAINING SCHEDULE
+# ============================================================================
+schedule:
+  # Frequency
+  frequency: "weekly"  # daily, weekly, biweekly
+  
+  # When to run (for weekly)
+  day_of_week: "sunday"  # monday, tuesday, ..., sunday
+  time: "02:00"  # 24h format
+  
+  # Incremental training (Phase 2+)
+  incremental:
+    enabled: false  # Enable in Phase 2
+    full_retrain_frequency: "biweekly"  # Full retrain every 2 weeks
 
-# Evaluation metrics
-evaluation:
-  metrics:
-    - "auc"
-    - "precision@10"
-    - "precision@20"
-    - "precision@50"
-    - "recall@50"
-    - "ndcg@10"
-
-# Logging
+# ============================================================================
+# MONITORING & LOGGING
+# ============================================================================
 logging:
   level: "INFO"
+  format: "[%(asctime)s] %(levelname)s - %(name)s - %(message)s"
   file: "logs/offline_training.log"
-  format: "[%(asctime)s] %(levelname)s - %(message)s"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+
+monitoring:
+  enabled: true
+  metrics:
+    - training_time
+    - model_auc
+    - feature_importance
+    - data_quality
+  
+  # Alerts
+  alerts:
+    min_auc: 0.70
+    max_training_time_hours: 3
+    min_data_size: 10000
+
+# ============================================================================
+# CHECKPOINTS
+# ============================================================================
+checkpoints:
+  enabled: true
+  dir: "checkpoints"
+  frequency: "hourly"  # Save checkpoint every hour during training
+  keep_last: 3  # Keep last 3 checkpoints
+
+# ============================================================================
+# OPTIMIZATION
+# ============================================================================
+optimization:
+  # Memory
+  low_memory_mode: false
+  max_memory_gb: 16
+  
+  # CPU
+  n_jobs: -1  # Use all CPUs
+  
+  # GPU (for embeddings)
+  use_gpu: true  # If available
+  gpu_device: 0
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+validation:
+  enabled: true
+  
+  # Metrics to track
+  metrics:
+    - auc
+    - precision@10
+    - recall@10
+    - ndcg@10
+    - map@10
+  
+  # Model selection
+  primary_metric: "auc"
+  minimize: false  # False = maximize
+
+# ============================================================================
+# EXPORT
+# ============================================================================
+export:
+  # Export for online serving
+  online_artifacts:
+    - embeddings
+    - cf_similarities
+    - ranking_model
+    - feature_metadata
+  
+  # Format
+  format: "pickle"  # pickle, onnx
+  compression: true

@@ -1,0 +1,12 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+COPY requirements/requirements_online.txt .
+RUN pip install --no-cache-dir -r requirements_online.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "scripts.online.api:app", "--host", "0.0.0.0", "--port", "8000"]

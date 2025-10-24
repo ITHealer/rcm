@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  offline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.offline
+    volumes:
+      - ./dataset:/app/dataset
+      - ./models:/app/models
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+  online:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.online
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+    depends_on:
+      - redis
+      - offline
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+volumes:
+  redis_data:

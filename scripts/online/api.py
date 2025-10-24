@@ -1,398 +1,480 @@
 """
-FASTAPI SERVER FOR ONLINE INFERENCE
-====================================
-REST API endpoints for recommendation service
+FASTAPI APPLICATION - RECOMMENDATION API
+========================================
+RESTful API for recommendation system
 
 Endpoints:
 - GET /feed - Get personalized feed
+- GET /friends - Get friend recommendations
+- POST /interaction - Log user interaction
+- GET /trending - Get trending posts
 - GET /health - Health check
-- GET /metrics - Performance metrics
-- GET /version - Model version info
-
-Usage: uvicorn api:app --reload
+- GET /metrics - System metrics
 """
 
 import os
 import sys
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Optional
 from datetime import datetime
 import logging
 
 # Add project root
 sys.path.append(str(Path(__file__).parent.parent.parent))
-# FastAPI imports
-try:
-    from fastapi import FastAPI, HTTPException, Query
-    from fastapi.responses import JSONResponse
-    from pydantic import BaseModel, Field
-    import uvicorn
-    FASTAPI_AVAILABLE = True
-except ImportError:
-    FASTAPI_AVAILABLE = False
-    print("⚠️  fastapi not available. Install: pip install fastapi uvicorn")
 
-# Add project root
-sys.path.append(str(Path(__file__).parent.parent.parent))
+# FastAPI imports
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
 
 # Import pipeline
 from recommender.online.online_inference_pipeline import OnlineInferencePipeline
 
-
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    level=os.getenv('LOG_LEVEL', 'INFO'),
+    format='[%(asctime)s] %(levelname)s - %(name)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 # PYDANTIC MODELS
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 
 class FeedRequest(BaseModel):
-    """Request model for feed generation"""
-    user_id: int = Field(..., description="User ID", example=123)
-    limit: int = Field(50, description="Number of posts", ge=1, le=100)
-    exclude_seen: Optional[List[int]] = Field(
-        None,
-        description="Post IDs to exclude"
-    )
-
-
-class FeedResponse(BaseModel):
-    """Response model for feed"""
+    """Feed request model"""
     user_id: int
-    posts: List[Dict]
-    count: int
-    latency_ms: float
-    model_version: str
+    limit: int = 50
+    exclude_seen: Optional[List[int]] = None
+
+
+class FriendRecommendationRequest(BaseModel):
+    """Friend recommendation request"""
+    user_id: int
+    limit: int = 20
+
+
+class InteractionRequest(BaseModel):
+    """User interaction logging"""
+    user_id: int
+    post_id: int
+    action: str  # like, comment, share, save, view, hide, report
 
 
 class HealthResponse(BaseModel):
     """Health check response"""
     status: str
-    model_version: str
-    redis_connected: bool
-    uptime_seconds: float
+    timestamp: str
+    version: str
+    components: dict
 
 
 class MetricsResponse(BaseModel):
-    """Performance metrics response"""
+    """Metrics response"""
     total_requests: int
     avg_latency_ms: float
     p50_latency_ms: float
     p95_latency_ms: float
     p99_latency_ms: float
+    error_rate: float
 
 
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 # FASTAPI APP
-# ════════════════════════════════════════════════════════════════════════
-
-if not FASTAPI_AVAILABLE:
-    raise ImportError("FastAPI required. Install: pip install fastapi uvicorn")
+# ============================================================================
 
 app = FastAPI(
     title="Recommendation API",
-    description="Online recommendation service with multi-channel recall and ML ranking",
+    description="Social network recommendation system",
     version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure properly in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Global pipeline instance
 pipeline = None
-start_time = datetime.now()
 
+# ============================================================================
+# STARTUP & SHUTDOWN
+# ============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize pipeline on startup"""
+    """
+    Initialize pipeline on startup
+    
+    FIXED: Load config from config file, not from individual arguments
+    """
     global pipeline
     
-    logger.info("="*70)
-    logger.info("STARTING RECOMMENDATION API")
-    logger.info("="*70)
-    
     try:
-        # Initialize pipeline
+        logger.info("="*70)
+        logger.info("🚀 STARTING RECOMMENDATION API")
+        logger.info("="*70)
+        
+        # Get configuration paths from environment or use defaults
+        config_path = os.getenv('CONFIG_PATH', 'configs/config_online.yaml')
+        models_dir = os.getenv('MODELS_DIR', 'models')
+        data_dir = os.getenv('DATA_DIR', 'dataset')
+        
+        # Check if Redis is available (from environment)
+        redis_host = os.getenv('REDIS_HOST')
+        use_redis = redis_host is not None
+        
+        logger.info(f"Config path: {config_path}")
+        logger.info(f"Models dir: {models_dir}")
+        logger.info(f"Data dir: {data_dir}")
+        logger.info(f"Redis: {'enabled' if use_redis else 'disabled'}")
+        
+        # Initialize pipeline with CORRECT arguments
+        # The pipeline reads Redis config from config_online.yaml
         pipeline = OnlineInferencePipeline(
-            models_dir=os.getenv(r'D:\hongthai\projects\wayjet_recommendation\recommendation_wayjet\models\v20251024_120504', 'models'),
-            redis_host=os.getenv('REDIS_HOST', 'localhost'),
-            redis_port=int(os.getenv('REDIS_PORT', 6380)),
-            redis_db=int(os.getenv('REDIS_DB', 0)),
-            use_redis=os.getenv('USE_REDIS', 'true').lower() == 'true'
+            config_path=config_path,
+            models_dir=models_dir,
+            data_dir=data_dir,
+            use_redis=use_redis
         )
         
-        logger.info("✅ API READY!")
-        logger.info("="*70 + "\n")
+        logger.info("✅ Pipeline initialized successfully!")
+        logger.info("="*70)
         
     except Exception as e:
         logger.error(f"❌ Failed to initialize pipeline: {e}", exc_info=True)
-        raise
+        # Don't exit - let health check report the issue
+        pipeline = None
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    logger.info("\n" + "="*70)
-    logger.info("SHUTTING DOWN API")
-    logger.info("="*70)
-    
-    # Print final metrics
-    if pipeline:
-        pipeline.print_metrics()
-    
-    logger.info("✅ API SHUTDOWN COMPLETE")
-    logger.info("="*70 + "\n")
+    logger.info("👋 Shutting down API server")
 
 
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 # ENDPOINTS
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
-        "service": "Recommendation API",
+        "message": "Recommendation API",
         "version": "1.0.0",
-        "status": "running",
-        "endpoints": {
-            "feed": "/feed?user_id=123&limit=50",
-            "health": "/health",
-            "metrics": "/metrics",
-            "version": "/version"
-        }
+        "status": "running" if pipeline is not None else "error",
+        "docs": "/docs"
     }
 
 
-@app.get("/feed", response_model=FeedResponse)
-async def get_feed(
-    user_id: int = Query(..., description="User ID", example=123),
-    limit: int = Query(50, description="Number of posts", ge=1, le=100),
-    exclude_seen: Optional[str] = Query(
-        None,
-        description="Comma-separated post IDs to exclude",
-        example="1,2,3"
+@app.get("/health")
+async def health_check() -> HealthResponse:
+    """
+    Health check endpoint
+    
+    Returns system health status
+    """
+    components = {
+        "pipeline": pipeline is not None,
+        "redis": False,
+        "models": False
+    }
+    
+    if pipeline is not None:
+        components["redis"] = pipeline.redis is not None
+        components["models"] = pipeline.ranking_model is not None
+    
+    status = "healthy" if all(components.values()) else "degraded"
+    
+    return HealthResponse(
+        status=status,
+        timestamp=datetime.now().isoformat(),
+        version="1.0.0",
+        components=components
     )
+
+
+@app.get("/metrics")
+async def get_metrics() -> MetricsResponse:
+    """
+    Get system metrics
+    
+    Returns performance metrics
+    """
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+    
+    metrics = pipeline.get_metrics()
+    
+    return MetricsResponse(
+        total_requests=metrics.get('total_requests', 0),
+        avg_latency_ms=metrics.get('avg_latency_ms', 0),
+        p50_latency_ms=metrics.get('p50_latency_ms', 0),
+        p95_latency_ms=metrics.get('p95_latency_ms', 0),
+        p99_latency_ms=metrics.get('p99_latency_ms', 0),
+        error_rate=0.0  # TODO: Track errors
+    )
+
+
+@app.get("/version")
+async def get_version():
+    """Get current model version"""
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+    
+    return {
+        "version": pipeline.current_version,
+        "metadata": pipeline.metadata
+    }
+
+
+@app.get("/feed")
+async def get_feed(
+    user_id: int = Query(..., description="User ID"),
+    limit: int = Query(50, ge=1, le=100, description="Number of posts"),
+    exclude_seen: Optional[str] = Query(None, description="Comma-separated post IDs to exclude")
 ):
     """
     Get personalized feed for user
     
     Args:
         user_id: Target user ID
-        limit: Number of posts (1-100)
-        exclude_seen: Comma-separated post IDs to exclude
+        limit: Number of posts to return (1-100)
+        exclude_seen: Comma-separated post IDs to exclude (e.g., "1,2,3")
     
     Returns:
-        Personalized feed with posts ranked by relevance
+        List of recommended posts with scores
     """
     if pipeline is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Service not ready. Pipeline not initialized."
-        )
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
     
     try:
         # Parse exclude_seen
-        exclude_set = None
+        exclude_list = None
         if exclude_seen:
-            exclude_set = {int(pid) for pid in exclude_seen.split(',')}
+            try:
+                exclude_list = [int(x.strip()) for x in exclude_seen.split(',')]
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid exclude_seen format")
         
         # Generate feed
-        import time
-        start = time.time()
-        
-        feed = pipeline.get_feed(
+        feed = pipeline.generate_feed(
             user_id=user_id,
             limit=limit,
-            exclude_seen=exclude_set
+            exclude_seen=exclude_list
         )
         
-        latency = (time.time() - start) * 1000
-        
-        # Response
-        return FeedResponse(
-            user_id=user_id,
-            posts=feed,
-            count=len(feed),
-            latency_ms=latency,
-            model_version=pipeline.current_version
-        )
+        return {
+            "user_id": user_id,
+            "posts": feed,
+            "count": len(feed),
+            "timestamp": datetime.now().isoformat()
+        }
         
     except Exception as e:
         logger.error(f"Error generating feed for user {user_id}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal server error: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/feed", response_model=FeedResponse)
-async def get_feed_post(request: FeedRequest):
+@app.get("/friends")
+async def get_friend_recommendations(
+    user_id: int = Query(..., description="User ID"),
+    limit: int = Query(20, ge=1, le=50, description="Number of recommendations")
+):
     """
-    Get personalized feed (POST version)
+    Get friend recommendations for user
     
-    Body:
-        {
-            "user_id": 123,
-            "limit": 50,
-            "exclude_seen": [1, 2, 3]
-        }
+    Args:
+        user_id: Target user ID
+        limit: Number of recommendations (1-50)
+    
+    Returns:
+        List of recommended friends with scores
     """
     if pipeline is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Service not ready. Pipeline not initialized."
-        )
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
     
     try:
-        # Generate feed
-        import time
-        start = time.time()
-        
-        exclude_set = set(request.exclude_seen) if request.exclude_seen else None
-        
-        feed = pipeline.get_feed(
-            user_id=request.user_id,
-            limit=request.limit,
-            exclude_seen=exclude_set
+        recommendations = pipeline.recommend_friends(
+            user_id=user_id,
+            k=limit
         )
         
-        latency = (time.time() - start) * 1000
-        
-        return FeedResponse(
-            user_id=request.user_id,
-            posts=feed,
-            count=len(feed),
-            latency_ms=latency,
-            model_version=pipeline.current_version
-        )
+        return {
+            "user_id": user_id,
+            "recommendations": recommendations,
+            "count": len(recommendations),
+            "timestamp": datetime.now().isoformat()
+        }
         
     except Exception as e:
-        logger.error(f"Error generating feed for user {request.user_id}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal server error: {str(e)}"
-        )
+        logger.error(f"Error recommending friends for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
+@app.post("/interaction")
+async def log_interaction(request: InteractionRequest):
     """
-    Health check endpoint
+    Log user interaction and update user embedding in real-time
+    
+    Args:
+        request: Interaction details (user_id, post_id, action)
     
     Returns:
-        Service health status
+        Success status
     """
     if pipeline is None:
-        return HealthResponse(
-            status="starting",
-            model_version="unknown",
-            redis_connected=False,
-            uptime_seconds=(datetime.now() - start_time).total_seconds()
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+    
+    try:
+        # Validate action
+        valid_actions = ['like', 'comment', 'share', 'save', 'view', 'hide', 'report']
+        if request.action not in valid_actions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid action. Must be one of: {', '.join(valid_actions)}"
+            )
+        
+        # Update user embedding (real-time)
+        pipeline.update_user_embedding_realtime(
+            user_id=request.user_id,
+            post_id=request.post_id,
+            action=request.action
         )
-    
-    # Check Redis
-    redis_connected = False
-    if pipeline.redis_client:
-        try:
-            pipeline.redis_client.ping()
-            redis_connected = True
-        except:
-            pass
-    
-    return HealthResponse(
-        status="healthy",
-        model_version=pipeline.current_version,
-        redis_connected=redis_connected,
-        uptime_seconds=(datetime.now() - start_time).total_seconds()
-    )
+        
+        # TODO: Log to database for tracking
+        
+        return {
+            "success": True,
+            "message": f"Interaction logged: user {request.user_id} {request.action}d post {request.post_id}",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error logging interaction: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/metrics", response_model=MetricsResponse)
-async def get_metrics():
+@app.get("/trending")
+async def get_trending(
+    limit: int = Query(100, ge=1, le=200, description="Number of trending posts")
+):
     """
-    Get performance metrics
+    Get trending posts (not personalized)
+    
+    Args:
+        limit: Number of posts (1-200)
     
     Returns:
-        Latency statistics
+        List of trending posts
     """
     if pipeline is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Service not ready."
-        )
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
     
-    metrics_summary = pipeline.get_metrics_summary()
-    
-    if not metrics_summary or 'total_latency' not in metrics_summary:
-        return MetricsResponse(
-            total_requests=0,
-            avg_latency_ms=0.0,
-            p50_latency_ms=0.0,
-            p95_latency_ms=0.0,
-            p99_latency_ms=0.0
-        )
-    
-    total_stats = metrics_summary['total_latency']
-    
-    return MetricsResponse(
-        total_requests=len(pipeline.metrics['total_latency']),
-        avg_latency_ms=total_stats['mean'],
-        p50_latency_ms=total_stats['p50'],
-        p95_latency_ms=total_stats['p95'],
-        p99_latency_ms=total_stats['p99']
-    )
+    try:
+        trending_posts = pipeline.trending_recall.recall(k=limit)
+        
+        return {
+            "posts": trending_posts,
+            "count": len(trending_posts),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting trending posts: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/version")
-async def get_version():
-    """
-    Get model version info
-    
-    Returns:
-        Model version and metadata
-    """
+# ============================================================================
+# DEBUG ENDPOINTS (Remove in production)
+# ============================================================================
+
+@app.get("/debug/components")
+async def debug_components():
+    """Debug: Check loaded components"""
     if pipeline is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Service not ready."
-        )
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
     
     return {
-        "model_version": pipeline.current_version,
-        "metadata": pipeline.metadata,
-        "artifacts": {
-            "post_embeddings": len(pipeline.embeddings['post']),
-            "user_embeddings": len(pipeline.embeddings['user']),
-            "cf_users": len(pipeline.cf_model['user_ids']),
-            "faiss_vectors": pipeline.faiss_index.ntotal,
-            "ranking_features": len(pipeline.ranking_feature_cols)
+        "embeddings": {
+            "post_count": len(pipeline.embeddings.get('post', {})),
+            "user_count": len(pipeline.embeddings.get('user', {}))
+        },
+        "faiss_index": pipeline.faiss_index is not None,
+        "faiss_posts": len(pipeline.faiss_post_ids),
+        "cf_model": pipeline.cf_model is not None,
+        "ranking_model": pipeline.ranking_model is not None,
+        "redis": pipeline.redis is not None,
+        "recall_channels": {
+            "following": pipeline.following_recall is not None,
+            "cf": pipeline.cf_recall is not None,
+            "content": pipeline.content_recall is not None,
+            "trending": pipeline.trending_recall is not None
         }
     }
 
 
-# ════════════════════════════════════════════════════════════════════════
-# MAIN
-# ════════════════════════════════════════════════════════════════════════
+@app.get("/debug/user/{user_id}")
+async def debug_user(user_id: int):
+    """Debug: Check user data"""
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+    
+    return {
+        "user_id": user_id,
+        "has_embedding": user_id in pipeline.embeddings.get('user', {}),
+        "has_stats": user_id in pipeline.user_stats,
+        "following_count": len(pipeline.following_dict.get(user_id, []))
+    }
+
+
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Global exception handler"""
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "detail": str(exc),
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
+# ============================================================================
+# MAIN (for testing)
+# ============================================================================
 
 if __name__ == "__main__":
-    """
-    Run API server
+    import uvicorn
     
-    Usage:
-        python api.py
-        
-    Or:
-        uvicorn api:app --reload --host 0.0.0.0 --port 8000
-    """
+    # Get config from environment
+    host = os.getenv('API_HOST', '0.0.0.0')
+    port = int(os.getenv('API_PORT', 8010))
+    
+    print(f"\n🚀 Starting API server on {host}:{port}\n")
+    
     uvicorn.run(
         "api:app",
-        host="0.0.0.0",
-        port=8010,
+        host=host,
+        port=port,
         reload=True,
         log_level="info"
     )
