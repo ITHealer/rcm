@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 def main(
     models_dir: str = 'models',
     redis_host: str = 'localhost',
-    redis_port: int = 6380,
+    redis_port: int = 6381,
     redis_db: int = 0,
     redis_password: str = None
 ):
@@ -209,7 +209,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--redis-port',
         type=int,
-        default=6380,
+        default=6381,
         help='Redis port (default: 6379)'
     )
     

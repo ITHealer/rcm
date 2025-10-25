@@ -60,7 +60,7 @@ class RedisCacheManager:
     def __init__(
         self,
         host: str = 'localhost',
-        port: int = 6380,
+        port: int = 6381,
         db: int = 0,
         password: Optional[str] = None
     ):

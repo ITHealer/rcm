@@ -54,7 +54,7 @@ models:
 # ============================================================================
 redis:
   host: "localhost"
-  port: 6380
+  port: 6381
   db: 0
   password: null
   max_connections: 50
@@ -73,6 +73,80 @@ redis:
     trending: 300                # 5 minutes
     feed_cache: 300              # 5 minutes
 
+
+telemetry:
+  enabled: true
+  mode: "queue"               # queue | direct | off
+  batch_size: 200
+  flush_interval_ms: 1000
+  max_queue: 100000
+  drop_on_overflow: true
+
+  # mysql:
+  #   enabled: true
+  #   url: "mysql+pymysql://user:password@mysql-host:3306/wayjet"
+  #   pool_size: 20
+  #   max_overflow: 40
+  #   pool_recycle: 1800
+  #   pool_pre_ping: true
+  mysql:                     # vẫn dùng key "mysql" cho thuận lợi code, nhưng là DSN Postgres
+    enabled: true
+    url: "postgresql+psycopg2://postgres:123456@localhost:5551/rcm_db"
+    pool_size: 20
+    max_overflow: 40
+    pool_recycle: 1800
+    pool_pre_ping: true
+
+  # (khuyến nghị) dùng Redis stream làm hàng đợi bền bỉ
+  redis_queue:
+    enabled: true
+    key: "telemetry:events"
+    maxlen: 200000
+
+# server=14.225.220.56;port=15479;database=wayjet_system;user=way_root;password=
+
+backend_db:
+  enabled: true
+  url: ""
+  pool_size: 20
+  max_overflow: 40
+  pool_recycle: 1800
+  pool_pre_ping: true
+  
+recall:
+  channels:
+    cf_realtime:
+      enabled: true
+      count: 150
+      k_per_seed: 50
+      max_recent: 20
+      weight_decay: 0.95
+
+
+realtime_ingest:
+  enabled: true
+  poll_interval_seconds: 15
+  max_rows_per_tick: 2000
+  backoff_on_error_seconds: 5
+  mysql:
+    interactions_table: "wayjet_system.PostReaction"   # schema.table
+    posts_table: "wayjet_system.Post"
+    id_column: "Id"
+    time_column: "CreateDate"          # <-- sửa
+    user_id_column: "UserId"
+    post_id_column: "PostId"
+    reaction_type_column: "ReactionTypeId"   # <-- thêm
+    status_column: "Status"                  # dùng để lọc status=10
+    post_author_column: "UserId"            # Post.UserId
+  watermark_key: "ingest:backend:last_id"
+  action_weights:
+    like: 1.0
+    comment: 1.5
+    share: 2.0
+    save: 1.2
+    view: 0.2
+  update_embedding_sample_rate: 0.2
+
 # ============================================================================
 # MULTI-CHANNEL RECALL
 # ============================================================================
@@ -87,7 +161,7 @@ recall:
       enabled: true
       count: 400
       weight: 0.40
-      recent_hours: 48
+      recent_hours: 1000 # dev thì nới ra 48h
       cache_ttl: 1800  # 30 minutes
     
     # Channel 2: Collaborative Filtering
@@ -113,7 +187,7 @@ recall:
       enabled: true
       count: 100
       weight: 0.10
-      trending_window_hours: 6
+      trending_window_hours: 720 #6
       min_engagement_count: 5
       cache_ttl: 300  # 5 minutes
       
@@ -143,6 +217,16 @@ ranking:
 # RE-RANKING & BUSINESS RULES
 # ============================================================================
 reranking:
+  max_consecutive_same_author: 2
+  max_same_author_in_feed: 5
+  freshness_enabled: true
+  freshness_boost_hours: 6
+  freshness_boost_factor: 1.1
+  quality_enabled: true
+  quality_status_ok_value: 10
+  content_dedup_enabled: true
+  use_min_score: false     # để nguyên false trừ khi bạn muốn lọc theo điểm ML
+  min_score: 0.3
   timeout_ms: 50  # Max time for reranking
   
   # Diversity rules

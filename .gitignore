@@ -4,3 +4,5 @@ dataset/
 uv.lock
 models/
 *.sql
+pgdata/
+*.pyc

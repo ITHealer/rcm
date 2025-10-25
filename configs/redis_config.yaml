@@ -4,7 +4,7 @@
 
 connection:
   host: "localhost"
-  port: 6380
+  port: 6381
   db: 0
   password: null
   decode_responses: false  # For binary data (embeddings)

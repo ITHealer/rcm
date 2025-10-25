@@ -342,7 +342,7 @@ class BatchEmbeddingGenerator:
             # Connect to Redis
             redis_client = redis.Redis(
                 host='localhost',
-                port=6380,
+                port=6381,
                 db=0,
                 decode_responses=False
             )

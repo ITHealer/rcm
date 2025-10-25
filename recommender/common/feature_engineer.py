@@ -651,13 +651,15 @@ class FeatureEngineer:
         user_stats: Dict,
         author_stats: Dict,
         following_dict: Dict,
-        embeddings: Optional[Dict] = None
+        embeddings: Optional[Dict] = None,
+        redis_client=None,     
     ):
         self.data = data
         self.user_stats = user_stats
         self.author_stats = author_stats
         self.following_dict = following_dict
         self.embeddings = embeddings if embeddings is not None else {}
+        self.redis = redis_client 
         
         # Cache for faster lookup
         self.user_df = data['user']

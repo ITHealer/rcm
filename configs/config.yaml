@@ -474,7 +474,7 @@ online:
 # ============================================================================
 redis:
   host: "localhost"
-  port: 6380
+  port: 6381
   db: 0
   password: null
   max_connections: 50
