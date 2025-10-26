@@ -6,3 +6,5 @@ models/
 *.sql
 pgdata/
 *.pyc
+configs/
+./configs/

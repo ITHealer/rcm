@@ -43,6 +43,53 @@ data:
     test_days: 7
     val_days: 7
 
+
+
+database:
+  # CHỈNH URL NÀY: mysql+pymysql://USER:PASS@HOST:3306/DBNAME?charset=utf8mb4
+  url: "mysql+pymysql://way_root:YmhNWpppahN92AtJotFDoHnCoW38keDp@14.225.220.56:15479/wayjet_system"
+
+  tables:
+    post_view: PostView
+    post_reaction: PostReaction
+    reaction_type: ReactionType
+    user: User
+    post: Post
+    post_hashtag: PostHashtag
+    friendship: Friendship
+    comment: Comment
+
+  # mapping reaction đúng như ảnh DB
+  reaction_code_map:
+    like: like
+    love: love
+    laugh: laugh
+    wow: wow
+    sad: sad
+    angry: angry
+    care: care
+  reaction_name_map:
+    Like: like
+    Love: love
+    Laugh: laugh
+    Wow: wow
+    Sad: sad
+    Angry: angry
+    Care: care
+
+training:
+  pretrain_full_export: true   # lần đầu lấy FULL (data bạn ~2 tháng)
+  window_days: 90
+  overlap_days: 2
+  half_life_days: 7
+  test_days: 3
+  val_days: 3
+  chunk_size: 100000
+
+artifacts:
+  base_dir: models
+  state_file: models/training_state.json
+
 # ============================================================================
 # TIME DECAY
 # ============================================================================

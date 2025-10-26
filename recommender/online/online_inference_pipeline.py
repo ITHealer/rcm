@@ -1596,13 +1596,698 @@
 
 
 
+# """
+# ONLINE INFERENCE PIPELINE - PRODUCTION READY
+# ============================================
+# Flow: Recall → Feature Extraction → Ranking → Re-ranking → Output
+# """
+
+# from __future__ import annotations
+# import os
+# import sys
+# import time
+# import logging
+# import warnings
+# from pathlib import Path
+# from typing import List, Dict, Optional, Tuple
+# from dataclasses import dataclass
+# from collections import defaultdict
+
+# import numpy as np
+# import pandas as pd
+# import yaml
+# from datetime import datetime
+
+# # Add project root
+# sys.path.append(str(Path(__file__).parent.parent.parent))
+
+# warnings.filterwarnings('ignore')
+# logger = logging.getLogger(__name__)
+
+# # Core imports
+# from recommender.offline.artifact_manager import ArtifactManager
+# from recommender.common.feature_engineer import FeatureEngineer
+
+# # Recall channels
+# from recommender.online.recall import (
+#     FollowingRecall,
+#     CFRecall,
+#     ContentRecall,
+#     TrendingRecall
+# )
+
+# # Ranking
+# from recommender.online.ranking import MLRanker, Reranker
+
+# # Optional caches
+# try:
+#     import redis
+#     REDIS_AVAILABLE = True
+# except ImportError:
+#     REDIS_AVAILABLE = False
+#     logger.warning("redis not available")
+
+# # SQLAlchemy (backend DB optional)
+# from sqlalchemy import create_engine, text
+# from sqlalchemy.orm import sessionmaker
+# from recommender.online.realtime_handlers import RealtimeHandlers
+# from recommender.online.realtime_jobs import RealTimeJobs
+# from recommender.online.recall.covisit import CovisitRecall
+
+# @dataclass
+# class RecallDiag:
+#     following: int = 0
+#     cf: int = 0
+#     content: int = 0
+#     trending: int = 0
+#     total: int = 0
+#     notes: Dict[str, str] = None
+
+
+# class OnlineInferencePipeline:
+#     """
+#     Complete online inference pipeline
+
+#     Features:
+#     - Multi-channel recall (4 channels)
+#     - ML ranking with LightGBM
+#     - Business rules re-ranking
+#     - Real-time user embedding updates
+#     - Redis caching
+#     """
+
+#     def __init__(
+#         self,
+#         config_path: str = 'configs/config_online.yaml',
+#         models_dir: str = 'models',
+#         data_dir: str = 'dataset',
+#         use_redis: bool = True
+#     ):
+#         self.models_dir = Path(models_dir)
+#         self.data_dir = Path(data_dir)
+
+#         # ============== STEP 1: CONFIG ==========================
+#         logger.info("\n" + "="*70)
+#         logger.info("INITIALIZING ONLINE INFERENCE PIPELINE")
+#         logger.info("="*70)
+
+#         with open(config_path, 'r', encoding='utf-8') as f:
+#             self.config = yaml.safe_load(f)
+
+#         self.recall_config = self.config.get('recall', {})
+#         self.ranking_config = self.config.get('ranking', {})
+#         self.reranking_config = self.config.get('reranking', {})
+
+#         # ============== STEP 2: REDIS ===========================
+#         self.redis = None
+#         if use_redis and REDIS_AVAILABLE:
+#             try:
+#                 rc = self.config.get('redis', {})
+#                 self.redis = redis.Redis(
+#                     host=rc.get('host', 'localhost'),
+#                     port=rc.get('port', 6381),
+#                     db=rc.get('db', 0),
+#                     decode_responses=False,
+#                     socket_timeout=rc.get('socket_timeout', 5),
+#                     max_connections=rc.get('max_connections', 50)
+#                 )
+#                 self.redis.ping()
+#                 logger.info("✅ Redis connected")
+#             except Exception as e:
+#                 logger.warning(f"Redis connection failed: {e}")
+#                 self.redis = None
+#         else:
+#             logger.warning("Redis disabled or not available")
+
+#         # ============== STEP 2b: BACKEND DB (MySQL optional) ====
+#         self.db_engine = None
+#         self.db_session_factory = None
+#         try:
+#             be = self.config.get('backend_db', {}) or {}
+#             if be.get('enabled'):
+#                 connect_args = be.get('connect_args', {}) or {}
+#                 self.db_engine = create_engine(
+#                     be['url'],
+#                     pool_size=be.get('pool_size', 20),
+#                     max_overflow=be.get('max_overflow', 40),
+#                     pool_recycle=be.get('pool_recycle', 1800),
+#                     pool_pre_ping=be.get('pool_pre_ping', True),
+#                     connect_args=connect_args,           # 👈 NEW
+#                     future=True,
+#                 )
+#                 self.db_session_factory = sessionmaker(
+#                     bind=self.db_engine, autocommit=False, autoflush=False, future=True
+#                 )
+#                 # Ping ngay và log chi tiết nếu fail
+#                 try:
+#                     with self.db_engine.connect() as conn:
+#                         conn.execute(text("SELECT 1"))
+#                     logger.info("✅ Backend DB connected")
+#                 except Exception as e:
+#                     logger.warning("Backend DB initial ping failed: %s", e)  # 👈 NEW
+#             else:
+#                 logger.info("Backend DB disabled in config")
+#         except Exception as e:
+#             logger.warning(f"Backend DB connection failed: {e}")
+#             self.db_engine = None
+#             self.db_session_factory = None
+
+#         # ============== STEP 3: ARTIFACTS =======================
+#         logger.info("\n📦 Loading model artifacts...")
+#         self.artifact_mgr = ArtifactManager(base_dir=str(self.models_dir))
+
+#         model_version = self.config.get('models', {}).get('version', 'latest')
+#         self.current_version = self.artifact_mgr.get_latest_version() if model_version == 'latest' else model_version
+
+#         artifacts = self.artifact_mgr.load_artifacts(self.current_version)
+
+#         self.embeddings = artifacts['embeddings']
+#         self.faiss_index = artifacts.get('faiss_index')
+#         self.faiss_post_ids = artifacts.get('faiss_post_ids', [])
+#         self.cf_model = artifacts['cf_model']
+#         self.ranking_model = artifacts['ranking_model']
+#         self.ranking_scaler = artifacts['ranking_scaler']
+#         self.ranking_feature_cols = artifacts['ranking_feature_cols']
+#         self.user_stats = artifacts['user_stats']
+#         self.author_stats = artifacts['author_stats']
+#         self.following_dict = artifacts['following_dict']
+#         self.metadata = artifacts.get('metadata', {})
+
+#         logger.info("✅ Artifacts loaded")
+
+#         # ============== STEP 4: DATA (for dev) ==================
+#         logger.info("\n📊 Loading data...")
+#         from recommender.common.data_loader import load_data
+#         self.data = load_data(str(self.data_dir))
+#         logger.info("✅ Data loaded")
+
+#         # ============== STEP 5: FEATURE ENGINEER ================
+#         self.feature_engineer = FeatureEngineer(
+#             data=self.data,
+#             user_stats=self.user_stats,
+#             author_stats=self.author_stats,
+#             following_dict=self.following_dict,
+#             embeddings=self.embeddings,
+#             redis_client=self.redis
+#         )
+
+#         # ============== STEP 6: RECALL CHANNELS =================
+#         channels_config = self.recall_config.get('channels', {})
+#         self.following_recall = FollowingRecall(
+#             redis_client=self.redis,
+#             data=self.data,
+#             following_dict=self.following_dict,
+#             config=channels_config.get('following', {})
+#         )
+#         self.cf_recall = CFRecall(
+#             redis_client=self.redis,
+#             data=self.data,
+#             cf_model=self.cf_model,
+#             config=channels_config.get('collaborative_filtering', {})
+#         )
+#         self.content_recall = ContentRecall(
+#             redis_client=self.redis,
+#             embeddings=self.embeddings,
+#             faiss_index=self.faiss_index,
+#             faiss_post_ids=self.faiss_post_ids,
+#             data=self.data,
+#             config=channels_config.get('content_based', {})
+#         )
+#         self.trending_recall = TrendingRecall(
+#             redis_client=self.redis,
+#             data=self.data,
+#             config=channels_config.get('trending', {})
+#         )
+
+#         # ============== STEP 7: RANKER & RERANKER ===============
+#         self.ranker = MLRanker(
+#             model=self.ranking_model,
+#             scaler=self.ranking_scaler,
+#             feature_cols=self.ranking_feature_cols,
+#             feature_engineer=self.feature_engineer,
+#             config=self.ranking_config
+#         )
+#         self.reranker = Reranker(config=self.reranking_config)
+
+#         # ============== METRICS =================================
+#         self.metrics = defaultdict(list)
+#         self._last_recall_diag: Optional[RecallDiag] = None
+#         self._last_no_feed_reasons: List[str] = []
+
+
+#         # Realtime helpers
+#         self.rt_handlers = RealtimeHandlers(self.redis, action_weights=self.config.get("user_embedding", {}).get("real_time_update", {}).get("action_weights", None))
+#         self.rt_jobs = RealTimeJobs(self.redis,
+#             interval_trending= self.config.get("recall", {}).get("channels", {}).get("trending", {}).get("refresh_interval_seconds", 300),
+#             interval_post_feat=900
+#         )
+#         self.rt_jobs.start()
+
+#         # Covisit recall (optional)
+#         self.covisit_recall = CovisitRecall(self.redis, k_per_anchor=25, max_anchors=5)
+
+#         logger.info("\n✅ ONLINE PIPELINE READY!")
+#         logger.info("="*70 + "\n")
+
+#     # ------------------------ Public APIs -----------------------
+
+#     def generate_feed(
+#         self,
+#         user_id: int,
+#         limit: int = 50,
+#         exclude_seen: Optional[List[int]] = None
+#     ) -> List[Dict]:
+#         """
+#         1) Recall -> 2) Feature Extraction & ML Ranking -> 3) Reranking (business rules)
+#         """
+#         start_time = time.time()
+#         self._last_no_feed_reasons = []
+#         try:
+#             # 1) Recall
+#             t1 = time.time()
+#             candidates, recall_diag = self._recall_candidates(user_id, target_count=self.recall_config.get("target_count", 1000))
+#             self._last_recall_diag = recall_diag
+#             self.metrics['recall_latency'].append((time.time() - t1) * 1000)
+
+#             if not candidates:
+#                 logger.warning(f"No candidates for user {user_id}")
+#                 return []
+
+#             # exclude seen
+#             if exclude_seen:
+#                 seen = set(exclude_seen)
+#                 candidates = [p for p in candidates if p not in seen]
+
+#             # 2) Ranking
+#             t2 = time.time()
+#             ranked_df = self.ranker.rank(user_id, candidates)
+#             self.metrics['ranking_latency'].append((time.time() - t2) * 1000)
+#             if ranked_df.empty:
+#                 self._last_no_feed_reasons.append("ranking_empty")
+#                 return []
+
+#             # Top-K (for rerank)
+#             top_k = int(self.ranking_config.get("top_k", 100))
+#             ranked_df = ranked_df.head(top_k)
+
+#             # 3) Rerank (with business rules) — NEED post_metadata
+#             t3 = time.time()
+#             post_meta = self._build_post_metadata(ranked_df['post_id'].tolist())
+#             final_feed = self.reranker.rerank(
+#                 ranked_df=ranked_df,
+#                 post_metadata=post_meta,
+#                 limit=limit
+#             )
+#             self.metrics['reranking_latency'].append((time.time() - t3) * 1000)
+
+#             self.metrics['total_latency'].append((time.time() - start_time) * 1000)
+#             logger.info(
+#                 "Feed generated for user %s: %s posts | Latency: %.1fms",
+#                 user_id, len(final_feed), self.metrics['total_latency'][-1]
+#             )
+#             return final_feed
+
+#         except Exception as e:
+#             logger.error(f"Error generating feed for user {user_id}: {e}", exc_info=True)
+#             return []
+
+#     def recommend_friends(self, user_id: int, k: int = 20) -> List[Dict]:
+#         # nếu bạn có FriendRecommendation module, gọi ở đây
+#         try:
+#             from recommender.online.friend_recommendation import FriendRecommendation
+#             fr = FriendRecommendation(
+#                 data=self.data,
+#                 embeddings=self.embeddings,
+#                 cf_model=self.cf_model,
+#                 config=self.config.get('friend_recommendation', {})
+#             )
+#             return fr.recommend_friends(user_id=user_id, k=k)
+#         except Exception as e:
+#             logger.error(f"Error recommending friends: {e}")
+#             return []
+
+#     def update_user_embedding_realtime(self, user_id: int, post_id: int, action: str):
+#         """Incremental update of user embedding after interaction"""
+#         conf = self.config.get('user_embedding', {}).get('real_time_update', {})
+#         if not conf.get('enabled', False):
+#             return
+#         triggers = conf.get('trigger_actions', [])
+#         if action not in triggers:
+#             return
+#         try:
+#             if post_id not in self.embeddings['post']:
+#                 return
+#             post_emb = self.embeddings['post'][post_id]
+#             old_emb = self.embeddings['user'][user_id] if user_id in self.embeddings['user'] else post_emb
+#             alpha = conf.get('incremental', {}).get('learning_rate', 0.1)
+#             weights = {'like': 1.0, 'comment': 1.5, 'share': 2.0, 'save': 1.2, 'view': 0.5}
+#             a = alpha * weights.get(action, 1.0)
+#             new_emb = (1 - a) * old_emb + a * post_emb
+#             new_emb = new_emb / (np.linalg.norm(new_emb) + 1e-8)
+#             self.embeddings['user'][user_id] = new_emb.astype(np.float32)
+#             if self.redis is not None:
+#                 try:
+#                     self.redis.setex(f"user:{user_id}:embedding", 604800, new_emb.tobytes())
+#                 except Exception:
+#                     pass
+#         except Exception as e:
+#             logger.error(f"update_user_embedding_realtime error: {e}")
+
+#     def get_metrics(self) -> Dict:
+#         if not self.metrics['total_latency']:
+#             return {
+#                 'total_requests': 0,
+#                 'avg_latency_ms': 0,
+#                 'p50_latency_ms': 0,
+#                 'p95_latency_ms': 0,
+#                 'p99_latency_ms': 0,
+#                 'avg_recall_latency_ms': 0,
+#                 'avg_ranking_latency_ms': 0,
+#                 'avg_reranking_latency_ms': 0
+#             }
+#         lat = self.metrics['total_latency']
+#         return {
+#             'total_requests': len(lat),
+#             'avg_latency_ms': float(np.mean(lat)),
+#             'p50_latency_ms': float(np.percentile(lat, 50)),
+#             'p95_latency_ms': float(np.percentile(lat, 95)),
+#             'p99_latency_ms': float(np.percentile(lat, 99)),
+#             'avg_recall_latency_ms': float(np.mean(self.metrics['recall_latency'])),
+#             'avg_ranking_latency_ms': float(np.mean(self.metrics['ranking_latency'])),
+#             'avg_reranking_latency_ms': float(np.mean(self.metrics['reranking_latency'])),
+#         }
+
+#     # ------------------------ Internals ------------------------
+
+#     # def _recall_candidates(self, user_id: int, target_count: int = 1000) -> Tuple[List[int], RecallDiag]:
+#     #     all_candidates: List[int] = []
+#     #     diag = RecallDiag(notes={})
+
+#     #     channels_cfg = self.recall_config.get('channels', {})
+        
+#     #     # Following
+#     #     try:
+#     #         cnt = self.recall_config['channels']['following'].get('count', 400)
+#     #         following_posts = self.following_recall.recall(user_id, k=cnt)
+#     #     except Exception as e:
+#     #         logger.debug(f"FollowingRecall failed: {e}")
+#     #         following_posts = []
+#     #     diag.following = len(following_posts); all_candidates.extend(following_posts)
+
+#     #     # CF
+#     #     try:
+#     #         cnt = self.recall_config['channels']['collaborative_filtering'].get('count', 300)
+#     #         cf_posts = self.cf_recall.recall(user_id, k=cnt)
+#     #     except Exception as e:
+#     #         logger.debug(f"CFRecall failed: {e}")
+#     #         cf_posts = []
+#     #     diag.cf = len(cf_posts); all_candidates.extend(cf_posts)
+
+#     #     # Content
+#     #     try:
+#     #         cnt = self.recall_config['channels']['content_based'].get('count', 200)
+#     #         content_posts = self.content_recall.recall(user_id, k=cnt)
+#     #     except Exception as e:
+#     #         logger.debug(f"ContentRecall failed: {e}")
+#     #         content_posts = []
+#     #     diag.content = len(content_posts); all_candidates.extend(content_posts)
+
+#     #     # Trending
+#     #     try:
+#     #         cnt = self.recall_config['channels']['trending'].get('count', 100)
+#     #         trending_posts = self.trending_recall.recall(k=cnt)
+#     #     except Exception as e:
+#     #         logger.debug(f"TrendingRecall failed: {e}")
+#     #         trending_posts = []
+#     #     diag.trending = len(trending_posts); all_candidates.extend(trending_posts)
+
+#     #     # Dedup & cap
+#     #     unique_candidates = list(dict.fromkeys(all_candidates))[:target_count]
+#     #     diag.total = len(unique_candidates)
+
+#     #     logger.info(
+#     #         "RECALL SUMMARY | user=%s | following=%s cf=%s content=%s trending=%s | total=%s",
+#     #         user_id, diag.following, diag.cf, diag.content, diag.trending, diag.total
+#     #     )
+
+#     #     # basic notes
+#     #     flw_cnt = self._user_following_count(user_id)
+#     #     if flw_cnt == 0 and diag.following == 0:
+#     #         diag.notes["following"] = "User has no following"
+#     #     tw = self.recall_config['channels']['trending'].get('trending_window_hours', 6)
+#     #     if diag.trending == 0 and self._trending_empty_last_hours(tw):
+#     #         diag.notes["trending"] = "No posts within trending window"
+#     #     if diag.content == 0 and not self._has_user_embedding(user_id):
+#     #         diag.notes["content"] = "User embedding missing (cold-start)"
+
+#     #     return unique_candidates, diag
+
+#     def _recall_candidates(self, user_id: int, target_count: int = 1000) -> list[int]:
+#         # 1. Khởi tạo diag và danh sách ứng viên
+#         all_candidates: List[int] = []
+#         diag = RecallDiag(notes={}) 
+
+#         channels_cfg = self.recall_config.get('channels', {})
+        
+#         # --- Following ---
+#         try:
+#             cnt = channels_cfg.get('following', {}).get('count', 400)
+#             following_posts = self.following_recall.recall(user_id, k=cnt)
+#         except Exception as e:
+#             logger.debug(f"FollowingRecall failed for user {user_id}: {e}")
+#             following_posts = []
+#         diag.following = len(following_posts)
+#         all_candidates.extend(following_posts)
+
+#         # --- CF ---
+#         try:
+#             cnt = channels_cfg.get('collaborative_filtering', {}).get('count', 300)
+#             cf_posts = self.cf_recall.recall(user_id, k=cnt)
+#         except Exception as e:
+#             logger.debug(f"CFRecall failed for user {user_id}: {e}")
+#             cf_posts = []
+#         diag.cf = len(cf_posts)
+#         all_candidates.extend(cf_posts)
+
+#         # --- Content ---
+#         try:
+#             cnt = channels_cfg.get('content_based', {}).get('count', 200)
+#             content_posts = self.content_recall.recall(user_id, k=cnt)
+#         except Exception as e:
+#             logger.debug(f"ContentRecall failed for user {user_id}: {e}")
+#             content_posts = []
+#         diag.content = len(content_posts)
+#         all_candidates.extend(content_posts)
+
+#         # --- Covisit (MỚI) ---
+#         try:
+#             # Lấy count từ config, mặc định là 150
+#             cnt = channels_cfg.get('covisit', {}).get('count', 150)
+#             covisit_posts = self.covisit_recall.recall(user_id, k=cnt)
+#         except Exception as e:
+#             logger.debug(f"CovisitRecall failed for user {user_id}: {e}")
+#             covisit_posts = []
+#         # Thêm trường covisit vào diag
+#         diag.covisit = len(covisit_posts) 
+#         all_candidates.extend(covisit_posts)
+
+#         # --- Trending ---
+#         try:
+#             cnt = channels_cfg.get('trending', {}).get('count', 100)
+#             # Trending recall thường không cần user_id
+#             trending_posts = self.trending_recall.recall(k=cnt) 
+#         except Exception as e:
+#             logger.debug(f"TrendingRecall failed: {e}")
+#             trending_posts = []
+#         diag.trending = len(trending_posts)
+#         all_candidates.extend(trending_posts)
+
+#         # Dedup & cap
+#         # Đảm bảo giữ thứ tự ưu tiên của các kênh recall bằng dict.fromkeys
+#         unique_candidates = list(dict.fromkeys(all_candidates))[:target_count]
+#         diag.total = len(unique_candidates)
+        
+#         # 2. Ghi logs TỔNG KẾT
+#         logger.info(
+#             "RECALL SUMMARY | user=%s | following=%s cf=%s content=%s covisit=%s trending=%s | total=%s",
+#             user_id, diag.following, diag.cf, diag.content, diag.covisit, diag.trending, diag.total
+#         )
+
+#         # basic notes
+#         flw_cnt = self._user_following_count(user_id)
+#         if flw_cnt == 0 and diag.following == 0:
+#             diag.notes["following"] = "User has no following"
+#         tw = self.recall_config['channels']['trending'].get('trending_window_hours', 6)
+#         if diag.trending == 0 and self._trending_empty_last_hours(tw):
+#             diag.notes["trending"] = "No posts within trending window"
+#         if diag.content == 0 and not self._has_user_embedding(user_id):
+#             diag.notes["content"] = "User embedding missing (cold-start)"
+
+#         return unique_candidates, diag
+
+#     def _safe_text(self, v) -> str:
+#         """Return '' if v is NaN/None/non-string; else normalized text."""
+#         if v is None:
+#             return ""
+#         # pandas NA/NaN
+#         try:
+#             import pandas as pd
+#             if pd.isna(v):
+#                 return ""
+#         except Exception:
+#             pass
+#         # only accept real strings
+#         if not isinstance(v, str):
+#             return ""
+#         return v.strip()
+
+#     def _build_post_metadata(self, post_ids: List[int]) -> Dict[int, Dict]:
+#         """
+#         Return per-post metadata for reranker:
+#           { post_id: {author_id, status, created_at, title, content, content_hash} }
+#         """
+#         meta: Dict[int, Dict] = {}
+
+#         # 1) from loaded data (CSV/dev)
+#         try:
+#             post_df: pd.DataFrame = self.data["post"]
+#             sub = post_df[post_df["Id"].isin(post_ids)][["Id", "UserId", "Status", "CreateDate", "Content"]].copy()
+#             for _, r in sub.iterrows():
+#                 pid = int(r["Id"])
+#                 meta[pid] = {
+#                     "author_id": int(r.get("UserId")) if not pd.isna(r.get("UserId")) else None,
+#                     "status": int(r.get("Status")) if not pd.isna(r.get("Status")) else None,
+#                     "created_at": pd.to_datetime(r.get("CreateDate"), errors="coerce", utc=True),
+#                     "title": "",
+#                     "content": (r.get("Content") or ""),
+#                     "content_hash": None
+#                 }
+#         except Exception:
+#             pass
+
+#         # 2) Fallback: query backend DB if missing
+#         missing = [pid for pid in post_ids if pid not in meta]
+#         if missing and self.db_session_factory:
+#             with self.db_session_factory() as s:
+#                 rows = s.execute(text("""
+#                     SELECT Id, UserId, Status, CreateDate, Content
+#                     FROM Post WHERE Id IN :ids
+#                 """), {"ids": tuple(missing)}).all()
+#                 for row in rows:
+#                     pid, uid, st, cd, ct = row
+#                     meta[int(pid)] = {
+#                         "author_id": int(uid) if uid is not None else None,
+#                         "status": int(st) if st is not None else None,
+#                         "created_at": pd.to_datetime(cd, errors="coerce", utc=True),
+#                         "title": self._safe_text(None),
+#                         "content": ct or "",
+#                         "content_hash": None
+#                     }
+
+#         # 3) Hash for dedup
+#         import hashlib
+#         for pid, m in meta.items():
+#             if not m.get("content_hash"):
+#                 title = self._safe_text(m.get("title")).lower()
+#                 body  = self._safe_text(m.get("content")).lower()
+#                 if title or body:
+#                     m["content_hash"] = hashlib.sha1(f"{title}|{body}".encode("utf-8")).hexdigest()
+
+#         return meta
+
+#     # ----- helpers for diag -----
+
+#     def _user_following_count(self, user_id: int) -> int:
+#         try:
+#             if self.following_dict is None:
+#                 return 0
+#             flw = self.following_dict.get(user_id, [])
+#             return len(flw) if flw is not None else 0
+#         except Exception:
+#             return 0
+
+#     def _has_user_embedding(self, user_id: int) -> bool:
+#         try:
+#             return user_id in (self.embeddings.get("user", {}) or {})
+#         except Exception:
+#             return False
+
+#     def _trending_empty_last_hours(self, hours: int) -> bool:
+#         try:
+#             post_df = self.data.get("post")
+#             if post_df is None or post_df.empty or "CreateDate" not in post_df.columns:
+#                 return True
+#             dt = pd.to_datetime(post_df["CreateDate"], errors="coerce", utc=True)
+#             cutoff = pd.Timestamp.utcnow() - pd.Timedelta(hours=hours)
+#             return bool((dt >= cutoff).sum() == 0)
+#         except Exception:
+#             return True
+
+#     # ----- backend DB utilities -----
+
+#     def ping_backend_db(self) -> bool:
+#         if self.db_engine is None:
+#             return False
+#         try:
+#             with self.db_engine.connect() as conn:
+#                 conn.execute(text("SELECT 1"))
+#             return True
+#         except Exception:
+#             return False
+
+#     def backend_db_stats(self) -> dict:
+#         if not self.db_session_factory:
+#             return {"connected": False}
+#         stats = {"connected": self.ping_backend_db()}
+#         try:
+#             with self.db_session_factory() as s:
+#                 posts = s.execute(text("SELECT COUNT(1) FROM Post")).scalar_one()
+#                 users = s.execute(text("SELECT COUNT(1) FROM User")).scalar_one()
+#                 reactions = s.execute(text("SELECT COUNT(1) FROM PostReaction")).scalar_one()
+#                 comments = s.execute(text("SELECT COUNT(1) FROM Comment")).scalar_one()
+#                 last_post = s.execute(text("SELECT MAX(CreateDate) FROM Post")).scalar_one()
+#                 stats.update({
+#                     "post_count": int(posts or 0),
+#                     "user_count": int(users or 0),
+#                     "reaction_count": int(reactions or 0),
+#                     "comment_count": int(comments or 0),
+#                     "last_post_at": str(last_post) if last_post else None,
+#                 })
+#         except Exception as e:
+#             stats.update({"error": str(e)})
+#         return stats
+
+#     def get_author_id(self, post_id: int) -> Optional[int]:
+#         # from dev data
+#         try:
+#             row = self.data["post"].loc[self.data["post"]["Id"] == post_id]
+#             if not row.empty:
+#                 return int(row["UserId"].iloc[0])
+#         except Exception:
+#             pass
+#         # fallback DB
+#         try:
+#             if self.db_session_factory:
+#                 with self.db_session_factory() as s:
+#                     r = s.execute(text("SELECT UserId FROM Post WHERE Id=:pid"), {"pid": post_id}).first()
+#                     return int(r[0]) if r else None
+#         except Exception:
+#             pass
+#         return None
+
+
 """
 ONLINE INFERENCE PIPELINE - PRODUCTION READY
 ============================================
 Flow: Recall → Feature Extraction → Ranking → Re-ranking → Output
+
+- Tương thích artifact “latest.version” (Windows-safe, không dùng symlink bắt buộc)
+- Không truyền following_dict/redis_client vào FeatureEngineer.__init__ (repo hiện tại không nhận arg này)
+- Gán following (nếu có) sau khi khởi tạo FeatureEngineer (giữ tương thích 2 phía)
 """
 
 from __future__ import annotations
+
 import os
 import sys
 import time
@@ -1616,52 +2301,137 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import yaml
-from datetime import datetime
 
 # Add project root
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
+logging.getLogger("lightgbm").setLevel(logging.WARNING)
 
-# Core imports
-from recommender.offline.artifact_manager import ArtifactManager
+# -------------------------------------------------------------------
+# Core & Artifacts
+# -------------------------------------------------------------------
+from recommender.offline.artifact_manager import ArtifactManager, get_latest_version_dir
 from recommender.common.feature_engineer import FeatureEngineer
 
+# -------------------------------------------------------------------
 # Recall channels
+# -------------------------------------------------------------------
 from recommender.online.recall import (
     FollowingRecall,
     CFRecall,
     ContentRecall,
-    TrendingRecall
+    TrendingRecall,
 )
+from recommender.online.recall.covisit import CovisitRecall
 
+# -------------------------------------------------------------------
 # Ranking
+# -------------------------------------------------------------------
 from recommender.online.ranking import MLRanker, Reranker
 
-# Optional caches
+# -------------------------------------------------------------------
+# Redis (optional)
+# -------------------------------------------------------------------
 try:
-    import redis
+    import redis as _redis
     REDIS_AVAILABLE = True
-except ImportError:
+except Exception:
+    _redis = None
     REDIS_AVAILABLE = False
     logger.warning("redis not available")
 
-# SQLAlchemy (backend DB optional)
+# -------------------------------------------------------------------
+# Backend DB (optional)
+# -------------------------------------------------------------------
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+
+# Realtime helpers
 from recommender.online.realtime_handlers import RealtimeHandlers
 from recommender.online.realtime_jobs import RealTimeJobs
-from recommender.online.recall.covisit import CovisitRecall
+
 
 @dataclass
 class RecallDiag:
     following: int = 0
     cf: int = 0
     content: int = 0
+    covisit: int = 0
     trending: int = 0
     total: int = 0
     notes: Dict[str, str] = None
+
+
+# =========================
+# Helper: load ranker artifacts
+# =========================
+def _load_ranker_artifacts(base_dir: str):
+    """
+    Load ranker artifacts theo format:
+      models/<version>/
+        - ranker_model.txt
+        - ranker_scaler.pkl
+        - ranker_feature_cols.pkl
+        - meta.json (optional)
+    Ưu tiên đọc latest.version / symlink latest.
+    Trả về: (model, scaler, feature_cols, meta_dict, version_dir)
+    """
+    import json
+    import pickle
+    from lightgbm import Booster
+
+    base = Path(base_dir)
+
+    # 1) Resolve version dir bằng offline.artifact_manager API
+    vdir = get_latest_version_dir(str(base))
+    if vdir is None:
+        # fallback: nếu config chỉ định thẳng folder
+        latest_file = base / "latest.version"
+        if latest_file.exists():
+            ver = latest_file.read_text(encoding="utf-8").strip()
+            vdir = base / ver
+        elif (base / "latest").is_symlink():
+            try:
+                vdir = (base / "latest").resolve(strict=True)
+            except Exception:
+                vdir = None
+    if vdir is None:
+        raise FileNotFoundError(
+            f"Cannot resolve latest model version under {base_dir}. "
+            f"Missing latest.version or latest symlink."
+        )
+
+    # 2) File names
+    f_model = vdir / "ranker_model.txt"
+    f_scaler = vdir / "ranker_scaler.pkl"
+    f_cols  = vdir / "ranker_feature_cols.pkl"
+    f_meta  = vdir / "meta.json"
+
+    # 3) Load
+    if not f_model.exists():
+        raise FileNotFoundError(f"Missing model file: {f_model}")
+    model = Booster(model_file=str(f_model))
+
+    scaler = None
+    if f_scaler.exists():
+        with f_scaler.open("rb") as f:
+            scaler = pickle.load(f)
+
+    feature_cols = None
+    if f_cols.exists():
+        with f_cols.open("rb") as f:
+            feature_cols = pickle.load(f)
+
+    meta = {}
+    if f_meta.exists():
+        try:
+            meta = json.loads(f_meta.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+
+    return model, scaler, feature_cols, meta, vdir
 
 
 class OnlineInferencePipeline:
@@ -1669,48 +2439,52 @@ class OnlineInferencePipeline:
     Complete online inference pipeline
 
     Features:
-    - Multi-channel recall (4 channels)
-    - ML ranking with LightGBM
+    - Multi-channel recall (following / CF / content / covisit / trending)
+    - ML ranking with LightGBM (tương thích artifact mới & cũ)
     - Business rules re-ranking
     - Real-time user embedding updates
-    - Redis caching
+    - Redis caching (ưu tiên), fallback MySQL
     """
 
     def __init__(
         self,
-        config_path: str = 'configs/config_online.yaml',
-        models_dir: str = 'models',
-        data_dir: str = 'dataset',
-        use_redis: bool = True
+        config_path: str = "configs/config_online.yaml",
+        models_dir: str = "models",
+        data_dir: str = "dataset",
+        use_redis: bool = True,
     ):
         self.models_dir = Path(models_dir)
         self.data_dir = Path(data_dir)
 
-        # ============== STEP 1: CONFIG ==========================
-        logger.info("\n" + "="*70)
+        logger.info("\n" + "=" * 70)
         logger.info("INITIALIZING ONLINE INFERENCE PIPELINE")
-        logger.info("="*70)
+        logger.info("=" * 70)
 
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = yaml.safe_load(f)
+        # ----------------- Step 1: CONFIG ----------------------
+        with open(config_path, "r", encoding="utf-8") as f:
+            self.config = yaml.safe_load(f) or {}
 
-        self.recall_config = self.config.get('recall', {})
-        self.ranking_config = self.config.get('ranking', {})
-        self.reranking_config = self.config.get('reranking', {})
+        self.recall_config = self.config.get("recall", {}) or {}
+        self.ranking_config = self.config.get("ranking", {}) or {}
+        self.reranking_config = self.config.get("reranking", {}) or {}
 
-        # ============== STEP 2: REDIS ===========================
-        self.redis = None
+        # ----------------- Step 2: REDIS -----------------------
+        self.redis: Optional[_redis.Redis] = None
         if use_redis and REDIS_AVAILABLE:
             try:
-                rc = self.config.get('redis', {})
-                self.redis = redis.Redis(
-                    host=rc.get('host', 'localhost'),
-                    port=rc.get('port', 6381),
-                    db=rc.get('db', 0),
-                    decode_responses=False,
-                    socket_timeout=rc.get('socket_timeout', 5),
-                    max_connections=rc.get('max_connections', 50)
-                )
+                rc = self.config.get("redis", {}) or {}
+                url = rc.get("url")
+                if url:
+                    self.redis = _redis.from_url(url, decode_responses=True)
+                else:
+                    self.redis = _redis.Redis(
+                        host=rc.get("host", "localhost"),
+                        port=rc.get("port", 6379),
+                        db=rc.get("db", 0),
+                        decode_responses=True,
+                        socket_timeout=rc.get("socket_timeout", 5),
+                        max_connections=rc.get("max_connections", 50),
+                    )
                 self.redis.ping()
                 logger.info("✅ Redis connected")
             except Exception as e:
@@ -1719,91 +2493,112 @@ class OnlineInferencePipeline:
         else:
             logger.warning("Redis disabled or not available")
 
-        # ============== STEP 2b: BACKEND DB (MySQL optional) ====
+        # ----------------- Step 2b: BACKEND DB (optional) ------
         self.db_engine = None
         self.db_session_factory = None
         try:
-            be = self.config.get('backend_db', {}) or {}
-            if be.get('enabled'):
-                connect_args = be.get('connect_args', {}) or {}
+            db = self.config.get("database", {}) or self.config.get("backend_db", {}) or {}
+            db_url = db.get("url")
+            if db_url:
                 self.db_engine = create_engine(
-                    be['url'],
-                    pool_size=be.get('pool_size', 20),
-                    max_overflow=be.get('max_overflow', 40),
-                    pool_recycle=be.get('pool_recycle', 1800),
-                    pool_pre_ping=be.get('pool_pre_ping', True),
-                    connect_args=connect_args,           # 👈 NEW
+                    db_url,
+                    pool_size=db.get("pool_size", 20),
+                    max_overflow=db.get("max_overflow", 40),
+                    pool_recycle=db.get("pool_recycle", 1800),
+                    pool_pre_ping=db.get("pool_pre_ping", True),
                     future=True,
                 )
                 self.db_session_factory = sessionmaker(
                     bind=self.db_engine, autocommit=False, autoflush=False, future=True
                 )
-                # Ping ngay và log chi tiết nếu fail
-                try:
-                    with self.db_engine.connect() as conn:
-                        conn.execute(text("SELECT 1"))
-                    logger.info("✅ Backend DB connected")
-                except Exception as e:
-                    logger.warning("Backend DB initial ping failed: %s", e)  # 👈 NEW
+                with self.db_engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                logger.info("✅ Backend DB connected")
             else:
-                logger.info("Backend DB disabled in config")
+                logger.info("Backend DB not configured")
         except Exception as e:
             logger.warning(f"Backend DB connection failed: {e}")
             self.db_engine = None
             self.db_session_factory = None
 
-        # ============== STEP 3: ARTIFACTS =======================
+        # ----------------- Step 3: ARTIFACTS -------------------
         logger.info("\n📦 Loading model artifacts...")
-        self.artifact_mgr = ArtifactManager(base_dir=str(self.models_dir))
 
-        model_version = self.config.get('models', {}).get('version', 'latest')
-        self.current_version = self.artifact_mgr.get_latest_version() if model_version == 'latest' else model_version
+        # ArtifactManager: chỉ dùng để resolve version dir 'latest'
+        self.artifact_mgr = ArtifactManager(artifacts_base_dir=str(self.models_dir))
 
-        artifacts = self.artifact_mgr.load_artifacts(self.current_version)
+        req_version = self.config.get("models", {}).get("version", "latest")
+        if req_version == "latest":
+            vdir = self.artifact_mgr.get_latest_version_dir()
+            if not vdir:
+                raise RuntimeError("No model version found in models/ (missing latest.version or symlink latest)")
+            self.current_version = vdir.name
+        else:
+            self.current_version = req_version
 
-        self.embeddings = artifacts['embeddings']
-        self.faiss_index = artifacts.get('faiss_index')
-        self.faiss_post_ids = artifacts.get('faiss_post_ids', [])
-        self.cf_model = artifacts['cf_model']
-        self.ranking_model = artifacts['ranking_model']
-        self.ranking_scaler = artifacts['ranking_scaler']
-        self.ranking_feature_cols = artifacts['ranking_feature_cols']
-        self.user_stats = artifacts['user_stats']
-        self.author_stats = artifacts['author_stats']
-        self.following_dict = artifacts['following_dict']
-        self.metadata = artifacts.get('metadata', {})
+        # Mặc định các artifact không bắt buộc (embeddings/cf…) — để compatible khi chưa có
+        self.embeddings = {}
+        self.faiss_index = None
+        self.faiss_post_ids = []
+        self.cf_model = None
+        self.user_stats = {}
+        self.author_stats = {}
+        self.following_dict = {}
+        self.metadata = {}
 
-        logger.info("✅ Artifacts loaded")
+        # Load ranker_* theo format mới
+        (
+            self.ranking_model,
+            self.ranking_scaler,
+            self.ranking_feature_cols,
+            meta2,
+            ver_dir,
+        ) = _load_ranker_artifacts(base_dir=str(self.models_dir))
+        self.metadata.update(meta2 or {})
+        self._version_dir = ver_dir
 
-        # ============== STEP 4: DATA (for dev) ==================
+        logger.info("✅ Ranker artifacts loaded")
+
+        # ----------------- Step 4: DATA (dev/feature) ----------
         logger.info("\n📊 Loading data...")
+        # Lưu ý: feature_engineer.py hiện kỳ vọng keys: users, posts, friendships, post_hashtags
+        # Hàm load_data (nếu của bạn trả về user/post/...) thì ta normalize lại.
         from recommender.common.data_loader import load_data
-        self.data = load_data(str(self.data_dir))
+        raw = load_data(str(self.data_dir)) or {}
+        self.data = self._normalize_data_keys(raw)
         logger.info("✅ Data loaded")
 
-        # ============== STEP 5: FEATURE ENGINEER ================
+        # ----------------- Step 5: FEATURE ENGINEER ------------
+        # ⚠️ FeatureEngineer trong repo hiện tại KHÔNG nhận following_dict/redis_client
         self.feature_engineer = FeatureEngineer(
             data=self.data,
             user_stats=self.user_stats,
             author_stats=self.author_stats,
-            following_dict=self.following_dict,
+            following=self.following_dict,          # mapping đúng với dataclass
             embeddings=self.embeddings,
-            redis_client=self.redis
         )
+        # nếu class có set_following_dict() / thuộc tính following: vẫn gán cho chắc
+        try:
+            if hasattr(self.feature_engineer, "set_following_dict"):
+                self.feature_engineer.set_following_dict(self.following_dict or {})
+            elif hasattr(self.feature_engineer, "following"):
+                setattr(self.feature_engineer, "following", self.following_dict or {})
+        except Exception:
+            pass
 
-        # ============== STEP 6: RECALL CHANNELS =================
-        channels_config = self.recall_config.get('channels', {})
+        # ----------------- Step 6: RECALL CHANNELS -------------
+        channels_config = self.recall_config.get("channels", {}) or {}
         self.following_recall = FollowingRecall(
             redis_client=self.redis,
             data=self.data,
             following_dict=self.following_dict,
-            config=channels_config.get('following', {})
+            config=channels_config.get("following", {}) or {},
         )
         self.cf_recall = CFRecall(
             redis_client=self.redis,
             data=self.data,
             cf_model=self.cf_model,
-            config=channels_config.get('collaborative_filtering', {})
+            config=channels_config.get("collaborative_filtering", {}) or {},
         )
         self.content_recall = ContentRecall(
             redis_client=self.redis,
@@ -1811,63 +2606,68 @@ class OnlineInferencePipeline:
             faiss_index=self.faiss_index,
             faiss_post_ids=self.faiss_post_ids,
             data=self.data,
-            config=channels_config.get('content_based', {})
+            config=channels_config.get("content_based", {}) or {},
         )
         self.trending_recall = TrendingRecall(
             redis_client=self.redis,
             data=self.data,
-            config=channels_config.get('trending', {})
+            config=channels_config.get("trending", {}) or {},
         )
+        self.covisit_recall = CovisitRecall(self.redis, k_per_anchor=25, max_anchors=5)
 
-        # ============== STEP 7: RANKER & RERANKER ===============
+        # ----------------- Step 7: RANKER & RERANK -------------
         self.ranker = MLRanker(
             model=self.ranking_model,
             scaler=self.ranking_scaler,
             feature_cols=self.ranking_feature_cols,
             feature_engineer=self.feature_engineer,
-            config=self.ranking_config
+            config=self.ranking_config,
         )
         self.reranker = Reranker(config=self.reranking_config)
 
-        # ============== METRICS =================================
+        # ----------------- METRICS -----------------------------
         self.metrics = defaultdict(list)
         self._last_recall_diag: Optional[RecallDiag] = None
         self._last_no_feed_reasons: List[str] = []
 
-
         # Realtime helpers
-        self.rt_handlers = RealtimeHandlers(self.redis, action_weights=self.config.get("user_embedding", {}).get("real_time_update", {}).get("action_weights", None))
-        self.rt_jobs = RealTimeJobs(self.redis,
-            interval_trending= self.config.get("recall", {}).get("channels", {}).get("trending", {}).get("refresh_interval_seconds", 300),
-            interval_post_feat=900
+        self.rt_handlers = RealtimeHandlers(
+            self.redis,
+            action_weights=self.config.get("user_embedding", {})
+            .get("real_time_update", {})
+            .get("action_weights", None),
+        )
+        self.rt_jobs = RealTimeJobs(
+            self.redis,
+            interval_trending=self.recall_config.get("channels", {})
+            .get("trending", {})
+            .get("refresh_interval_seconds", 300),
+            interval_post_feat=900,
         )
         self.rt_jobs.start()
 
-        # Covisit recall (optional)
-        self.covisit_recall = CovisitRecall(self.redis, k_per_anchor=25, max_anchors=5)
-
         logger.info("\n✅ ONLINE PIPELINE READY!")
-        logger.info("="*70 + "\n")
+        logger.info("=" * 70 + "\n")
 
-    # ------------------------ Public APIs -----------------------
-
+    # ------------------------------------------------------------------
+    # PUBLIC APIS
+    # ------------------------------------------------------------------
     def generate_feed(
-        self,
-        user_id: int,
-        limit: int = 50,
-        exclude_seen: Optional[List[int]] = None
+        self, user_id: int, limit: int = 50, exclude_seen: Optional[List[int]] = None
     ) -> List[Dict]:
         """
-        1) Recall -> 2) Feature Extraction & ML Ranking -> 3) Reranking (business rules)
+        1) Recall -> 2) Feature Extraction & ML Ranking -> 3) Reranking
         """
         start_time = time.time()
         self._last_no_feed_reasons = []
         try:
             # 1) Recall
             t1 = time.time()
-            candidates, recall_diag = self._recall_candidates(user_id, target_count=self.recall_config.get("target_count", 1000))
+            candidates, recall_diag = self._recall_candidates(
+                user_id, target_count=self.recall_config.get("target_count", 1000)
+            )
             self._last_recall_diag = recall_diag
-            self.metrics['recall_latency'].append((time.time() - t1) * 1000)
+            self.metrics["recall_latency"].append((time.time() - t1) * 1000)
 
             if not candidates:
                 logger.warning(f"No candidates for user {user_id}")
@@ -1881,7 +2681,7 @@ class OnlineInferencePipeline:
             # 2) Ranking
             t2 = time.time()
             ranked_df = self.ranker.rank(user_id, candidates)
-            self.metrics['ranking_latency'].append((time.time() - t2) * 1000)
+            self.metrics["ranking_latency"].append((time.time() - t2) * 1000)
             if ranked_df.empty:
                 self._last_no_feed_reasons.append("ranking_empty")
                 return []
@@ -1890,36 +2690,34 @@ class OnlineInferencePipeline:
             top_k = int(self.ranking_config.get("top_k", 100))
             ranked_df = ranked_df.head(top_k)
 
-            # 3) Rerank (with business rules) — NEED post_metadata
+            # 3) Reranking với business rules
             t3 = time.time()
-            post_meta = self._build_post_metadata(ranked_df['post_id'].tolist())
+            post_meta = self._build_post_metadata(ranked_df["post_id"].tolist())
             final_feed = self.reranker.rerank(
-                ranked_df=ranked_df,
-                post_metadata=post_meta,
-                limit=limit
+                ranked_df=ranked_df, post_metadata=post_meta, limit=limit
             )
-            self.metrics['reranking_latency'].append((time.time() - t3) * 1000)
+            self.metrics["reranking_latency"].append((time.time() - t3) * 1000)
 
-            self.metrics['total_latency'].append((time.time() - start_time) * 1000)
+            self.metrics["total_latency"].append((time.time() - start_time) * 1000)
             logger.info(
                 "Feed generated for user %s: %s posts | Latency: %.1fms",
-                user_id, len(final_feed), self.metrics['total_latency'][-1]
+                user_id,
+                len(final_feed),
+                self.metrics["total_latency"][-1],
             )
             return final_feed
-
         except Exception as e:
             logger.error(f"Error generating feed for user {user_id}: {e}", exc_info=True)
             return []
 
     def recommend_friends(self, user_id: int, k: int = 20) -> List[Dict]:
-        # nếu bạn có FriendRecommendation module, gọi ở đây
         try:
             from recommender.online.friend_recommendation import FriendRecommendation
             fr = FriendRecommendation(
                 data=self.data,
                 embeddings=self.embeddings,
                 cf_model=self.cf_model,
-                config=self.config.get('friend_recommendation', {})
+                config=self.config.get("friend_recommendation", {}) or {},
             )
             return fr.recommend_friends(user_id=user_id, k=k)
         except Exception as e:
@@ -1928,130 +2726,91 @@ class OnlineInferencePipeline:
 
     def update_user_embedding_realtime(self, user_id: int, post_id: int, action: str):
         """Incremental update of user embedding after interaction"""
-        conf = self.config.get('user_embedding', {}).get('real_time_update', {})
-        if not conf.get('enabled', False):
+        conf = self.config.get("user_embedding", {}).get("real_time_update", {}) or {}
+        if not conf.get("enabled", False):
             return
-        triggers = conf.get('trigger_actions', [])
+        triggers = conf.get("trigger_actions", []) or []
         if action not in triggers:
             return
         try:
-            if post_id not in self.embeddings['post']:
+            if post_id not in (self.embeddings.get("post", {}) or {}):
                 return
-            post_emb = self.embeddings['post'][post_id]
-            old_emb = self.embeddings['user'][user_id] if user_id in self.embeddings['user'] else post_emb
-            alpha = conf.get('incremental', {}).get('learning_rate', 0.1)
-            weights = {'like': 1.0, 'comment': 1.5, 'share': 2.0, 'save': 1.2, 'view': 0.5}
+            post_emb = self.embeddings["post"][post_id]
+            old_emb = (
+                self.embeddings["user"][user_id]
+                if user_id in (self.embeddings.get("user", {}) or {})
+                else post_emb
+            )
+            alpha = conf.get("incremental", {}).get("learning_rate", 0.1)
+            weights = {"like": 1.0, "comment": 1.5, "share": 2.0, "save": 1.2, "view": 0.5}
             a = alpha * weights.get(action, 1.0)
             new_emb = (1 - a) * old_emb + a * post_emb
             new_emb = new_emb / (np.linalg.norm(new_emb) + 1e-8)
-            self.embeddings['user'][user_id] = new_emb.astype(np.float32)
+            self.embeddings.setdefault("user", {})[user_id] = new_emb.astype(np.float32)
             if self.redis is not None:
                 try:
-                    self.redis.setex(f"user:{user_id}:embedding", 604800, new_emb.tobytes())
+                    self.redis.setex(
+                        f"user:{user_id}:embedding", 7 * 24 * 3600, new_emb.tobytes()
+                    )
                 except Exception:
                     pass
         except Exception as e:
             logger.error(f"update_user_embedding_realtime error: {e}")
 
     def get_metrics(self) -> Dict:
-        if not self.metrics['total_latency']:
+        if not self.metrics["total_latency"]:
             return {
-                'total_requests': 0,
-                'avg_latency_ms': 0,
-                'p50_latency_ms': 0,
-                'p95_latency_ms': 0,
-                'p99_latency_ms': 0,
-                'avg_recall_latency_ms': 0,
-                'avg_ranking_latency_ms': 0,
-                'avg_reranking_latency_ms': 0
+                "total_requests": 0,
+                "avg_latency_ms": 0,
+                "p50_latency_ms": 0,
+                "p95_latency_ms": 0,
+                "p99_latency_ms": 0,
+                "avg_recall_latency_ms": 0,
+                "avg_ranking_latency_ms": 0,
+                "avg_reranking_latency_ms": 0,
             }
-        lat = self.metrics['total_latency']
+        lat = self.metrics["total_latency"]
         return {
-            'total_requests': len(lat),
-            'avg_latency_ms': float(np.mean(lat)),
-            'p50_latency_ms': float(np.percentile(lat, 50)),
-            'p95_latency_ms': float(np.percentile(lat, 95)),
-            'p99_latency_ms': float(np.percentile(lat, 99)),
-            'avg_recall_latency_ms': float(np.mean(self.metrics['recall_latency'])),
-            'avg_ranking_latency_ms': float(np.mean(self.metrics['ranking_latency'])),
-            'avg_reranking_latency_ms': float(np.mean(self.metrics['reranking_latency'])),
+            "total_requests": len(lat),
+            "avg_latency_ms": float(np.mean(lat)),
+            "p50_latency_ms": float(np.percentile(lat, 50)),
+            "p95_latency_ms": float(np.percentile(lat, 95)),
+            "p99_latency_ms": float(np.percentile(lat, 99)),
+            "avg_recall_latency_ms": float(np.mean(self.metrics["recall_latency"])),
+            "avg_ranking_latency_ms": float(np.mean(self.metrics["ranking_latency"])),
+            "avg_reranking_latency_ms": float(np.mean(self.metrics["reranking_latency"])),
         }
 
-    # ------------------------ Internals ------------------------
+    # ------------------------------------------------------------------
+    # INTERNALS
+    # ------------------------------------------------------------------
+    def _normalize_data_keys(self, raw: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        """
+        Chuẩn hoá keys để khớp FeatureEngineer hiện tại:
+          FE kỳ vọng: users, posts, friendships, post_hashtags
+          (nếu loader trả: user, post, friendship, post_hashtag thì map lại)
+        """
+        if raw is None:
+            return {}
+        data = dict(raw)
+        # map phổ biến
+        if "users" not in data and "user" in data: data["users"] = data["user"]
+        if "posts" not in data and "post" in data: data["posts"] = data["post"]
+        if "friendships" not in data and "friendship" in data: data["friendships"] = data["friendship"]
+        if "post_hashtags" not in data and "post_hashtag" in data: data["post_hashtags"] = data["post_hashtag"]
+        return data
 
-    # def _recall_candidates(self, user_id: int, target_count: int = 1000) -> Tuple[List[int], RecallDiag]:
-    #     all_candidates: List[int] = []
-    #     diag = RecallDiag(notes={})
-
-    #     channels_cfg = self.recall_config.get('channels', {})
-        
-    #     # Following
-    #     try:
-    #         cnt = self.recall_config['channels']['following'].get('count', 400)
-    #         following_posts = self.following_recall.recall(user_id, k=cnt)
-    #     except Exception as e:
-    #         logger.debug(f"FollowingRecall failed: {e}")
-    #         following_posts = []
-    #     diag.following = len(following_posts); all_candidates.extend(following_posts)
-
-    #     # CF
-    #     try:
-    #         cnt = self.recall_config['channels']['collaborative_filtering'].get('count', 300)
-    #         cf_posts = self.cf_recall.recall(user_id, k=cnt)
-    #     except Exception as e:
-    #         logger.debug(f"CFRecall failed: {e}")
-    #         cf_posts = []
-    #     diag.cf = len(cf_posts); all_candidates.extend(cf_posts)
-
-    #     # Content
-    #     try:
-    #         cnt = self.recall_config['channels']['content_based'].get('count', 200)
-    #         content_posts = self.content_recall.recall(user_id, k=cnt)
-    #     except Exception as e:
-    #         logger.debug(f"ContentRecall failed: {e}")
-    #         content_posts = []
-    #     diag.content = len(content_posts); all_candidates.extend(content_posts)
-
-    #     # Trending
-    #     try:
-    #         cnt = self.recall_config['channels']['trending'].get('count', 100)
-    #         trending_posts = self.trending_recall.recall(k=cnt)
-    #     except Exception as e:
-    #         logger.debug(f"TrendingRecall failed: {e}")
-    #         trending_posts = []
-    #     diag.trending = len(trending_posts); all_candidates.extend(trending_posts)
-
-    #     # Dedup & cap
-    #     unique_candidates = list(dict.fromkeys(all_candidates))[:target_count]
-    #     diag.total = len(unique_candidates)
-
-    #     logger.info(
-    #         "RECALL SUMMARY | user=%s | following=%s cf=%s content=%s trending=%s | total=%s",
-    #         user_id, diag.following, diag.cf, diag.content, diag.trending, diag.total
-    #     )
-
-    #     # basic notes
-    #     flw_cnt = self._user_following_count(user_id)
-    #     if flw_cnt == 0 and diag.following == 0:
-    #         diag.notes["following"] = "User has no following"
-    #     tw = self.recall_config['channels']['trending'].get('trending_window_hours', 6)
-    #     if diag.trending == 0 and self._trending_empty_last_hours(tw):
-    #         diag.notes["trending"] = "No posts within trending window"
-    #     if diag.content == 0 and not self._has_user_embedding(user_id):
-    #         diag.notes["content"] = "User embedding missing (cold-start)"
-
-    #     return unique_candidates, diag
-
-    def _recall_candidates(self, user_id: int, target_count: int = 1000) -> list[int]:
-        # 1. Khởi tạo diag và danh sách ứng viên
+    def _recall_candidates(
+        self, user_id: int, target_count: int = 1000
+    ) -> Tuple[List[int], RecallDiag]:
         all_candidates: List[int] = []
-        diag = RecallDiag(notes={}) 
+        diag = RecallDiag(notes={})
 
-        channels_cfg = self.recall_config.get('channels', {})
-        
-        # --- Following ---
+        channels_cfg = self.recall_config.get("channels", {}) or {}
+
+        # Following
         try:
-            cnt = channels_cfg.get('following', {}).get('count', 400)
+            cnt = channels_cfg.get("following", {}).get("count", 400)
             following_posts = self.following_recall.recall(user_id, k=cnt)
         except Exception as e:
             logger.debug(f"FollowingRecall failed for user {user_id}: {e}")
@@ -2059,9 +2818,9 @@ class OnlineInferencePipeline:
         diag.following = len(following_posts)
         all_candidates.extend(following_posts)
 
-        # --- CF ---
+        # CF
         try:
-            cnt = channels_cfg.get('collaborative_filtering', {}).get('count', 300)
+            cnt = channels_cfg.get("collaborative_filtering", {}).get("count", 300)
             cf_posts = self.cf_recall.recall(user_id, k=cnt)
         except Exception as e:
             logger.debug(f"CFRecall failed for user {user_id}: {e}")
@@ -2069,9 +2828,9 @@ class OnlineInferencePipeline:
         diag.cf = len(cf_posts)
         all_candidates.extend(cf_posts)
 
-        # --- Content ---
+        # Content
         try:
-            cnt = channels_cfg.get('content_based', {}).get('count', 200)
+            cnt = channels_cfg.get("content_based", {}).get("count", 200)
             content_posts = self.content_recall.recall(user_id, k=cnt)
         except Exception as e:
             logger.debug(f"ContentRecall failed for user {user_id}: {e}")
@@ -2079,45 +2838,45 @@ class OnlineInferencePipeline:
         diag.content = len(content_posts)
         all_candidates.extend(content_posts)
 
-        # --- Covisit (MỚI) ---
+        # Covisit
         try:
-            # Lấy count từ config, mặc định là 150
-            cnt = channels_cfg.get('covisit', {}).get('count', 150)
+            cnt = channels_cfg.get("covisit", {}).get("count", 150)
             covisit_posts = self.covisit_recall.recall(user_id, k=cnt)
         except Exception as e:
             logger.debug(f"CovisitRecall failed for user {user_id}: {e}")
             covisit_posts = []
-        # Thêm trường covisit vào diag
-        diag.covisit = len(covisit_posts) 
+        diag.covisit = len(covisit_posts)
         all_candidates.extend(covisit_posts)
 
-        # --- Trending ---
+        # Trending
         try:
-            cnt = channels_cfg.get('trending', {}).get('count', 100)
-            # Trending recall thường không cần user_id
-            trending_posts = self.trending_recall.recall(k=cnt) 
+            cnt = channels_cfg.get("trending", {}).get("count", 100)
+            trending_posts = self.trending_recall.recall(k=cnt)
         except Exception as e:
             logger.debug(f"TrendingRecall failed: {e}")
             trending_posts = []
         diag.trending = len(trending_posts)
         all_candidates.extend(trending_posts)
 
-        # Dedup & cap
-        # Đảm bảo giữ thứ tự ưu tiên của các kênh recall bằng dict.fromkeys
         unique_candidates = list(dict.fromkeys(all_candidates))[:target_count]
         diag.total = len(unique_candidates)
-        
-        # 2. Ghi logs TỔNG KẾT
+
         logger.info(
             "RECALL SUMMARY | user=%s | following=%s cf=%s content=%s covisit=%s trending=%s | total=%s",
-            user_id, diag.following, diag.cf, diag.content, diag.covisit, diag.trending, diag.total
+            user_id,
+            diag.following,
+            diag.cf,
+            diag.content,
+            diag.covisit,
+            diag.trending,
+            diag.total,
         )
 
-        # basic notes
+        # Notes
         flw_cnt = self._user_following_count(user_id)
         if flw_cnt == 0 and diag.following == 0:
             diag.notes["following"] = "User has no following"
-        tw = self.recall_config['channels']['trending'].get('trending_window_hours', 6)
+        tw = channels_cfg.get("trending", {}).get("trending_window_hours", 6)
         if diag.trending == 0 and self._trending_empty_last_hours(tw):
             diag.notes["trending"] = "No posts within trending window"
         if diag.content == 0 and not self._has_user_embedding(user_id):
@@ -2126,53 +2885,51 @@ class OnlineInferencePipeline:
         return unique_candidates, diag
 
     def _safe_text(self, v) -> str:
-        """Return '' if v is NaN/None/non-string; else normalized text."""
         if v is None:
             return ""
-        # pandas NA/NaN
         try:
-            import pandas as pd
             if pd.isna(v):
                 return ""
         except Exception:
             pass
-        # only accept real strings
         if not isinstance(v, str):
             return ""
         return v.strip()
 
     def _build_post_metadata(self, post_ids: List[int]) -> Dict[int, Dict]:
-        """
-        Return per-post metadata for reranker:
-          { post_id: {author_id, status, created_at, title, content, content_hash} }
-        """
         meta: Dict[int, Dict] = {}
 
-        # 1) from loaded data (CSV/dev)
+        # 1) từ data đã load (CSV/dev) — chú ý: theo FE keys là 'posts'
         try:
-            post_df: pd.DataFrame = self.data["post"]
-            sub = post_df[post_df["Id"].isin(post_ids)][["Id", "UserId", "Status", "CreateDate", "Content"]].copy()
+            post_df: pd.DataFrame = self.data["posts"]
+            sub = post_df[post_df["Id"].isin(post_ids)][
+                ["Id", "UserId", "Status", "CreateDate", "Content"]
+            ].copy()
             for _, r in sub.iterrows():
                 pid = int(r["Id"])
                 meta[pid] = {
-                    "author_id": int(r.get("UserId")) if not pd.isna(r.get("UserId")) else None,
+                    "author_id": int(r.get("UserId"))
+                    if not pd.isna(r.get("UserId"))
+                    else None,
                     "status": int(r.get("Status")) if not pd.isna(r.get("Status")) else None,
                     "created_at": pd.to_datetime(r.get("CreateDate"), errors="coerce", utc=True),
                     "title": "",
                     "content": (r.get("Content") or ""),
-                    "content_hash": None
+                    "content_hash": None,
                 }
         except Exception:
             pass
 
-        # 2) Fallback: query backend DB if missing
+        # 2) Fallback DB nếu thiếu
         missing = [pid for pid in post_ids if pid not in meta]
         if missing and self.db_session_factory:
             with self.db_session_factory() as s:
-                rows = s.execute(text("""
-                    SELECT Id, UserId, Status, CreateDate, Content
-                    FROM Post WHERE Id IN :ids
-                """), {"ids": tuple(missing)}).all()
+                rows = s.execute(
+                    text(
+                        "SELECT Id, UserId, Status, CreateDate, Content FROM Post WHERE Id IN :ids"
+                    ),
+                    {"ids": tuple(missing)},
+                ).all()
                 for row in rows:
                     pid, uid, st, cd, ct = row
                     meta[int(pid)] = {
@@ -2181,22 +2938,21 @@ class OnlineInferencePipeline:
                         "created_at": pd.to_datetime(cd, errors="coerce", utc=True),
                         "title": self._safe_text(None),
                         "content": ct or "",
-                        "content_hash": None
+                        "content_hash": None,
                     }
 
-        # 3) Hash for dedup
+        # 3) Hash nội dung cho dedup
         import hashlib
         for pid, m in meta.items():
             if not m.get("content_hash"):
                 title = self._safe_text(m.get("title")).lower()
-                body  = self._safe_text(m.get("content")).lower()
+                body = self._safe_text(m.get("content")).lower()
                 if title or body:
                     m["content_hash"] = hashlib.sha1(f"{title}|{body}".encode("utf-8")).hexdigest()
 
         return meta
 
     # ----- helpers for diag -----
-
     def _user_following_count(self, user_id: int) -> int:
         try:
             if self.following_dict is None:
@@ -2214,7 +2970,7 @@ class OnlineInferencePipeline:
 
     def _trending_empty_last_hours(self, hours: int) -> bool:
         try:
-            post_df = self.data.get("post")
+            post_df = self.data.get("posts")
             if post_df is None or post_df.empty or "CreateDate" not in post_df.columns:
                 return True
             dt = pd.to_datetime(post_df["CreateDate"], errors="coerce", utc=True)
@@ -2224,7 +2980,6 @@ class OnlineInferencePipeline:
             return True
 
     # ----- backend DB utilities -----
-
     def ping_backend_db(self) -> bool:
         if self.db_engine is None:
             return False
@@ -2246,21 +3001,23 @@ class OnlineInferencePipeline:
                 reactions = s.execute(text("SELECT COUNT(1) FROM PostReaction")).scalar_one()
                 comments = s.execute(text("SELECT COUNT(1) FROM Comment")).scalar_one()
                 last_post = s.execute(text("SELECT MAX(CreateDate) FROM Post")).scalar_one()
-                stats.update({
-                    "post_count": int(posts or 0),
-                    "user_count": int(users or 0),
-                    "reaction_count": int(reactions or 0),
-                    "comment_count": int(comments or 0),
-                    "last_post_at": str(last_post) if last_post else None,
-                })
+                stats.update(
+                    {
+                        "post_count": int(posts or 0),
+                        "user_count": int(users or 0),
+                        "reaction_count": int(reactions or 0),
+                        "comment_count": int(comments or 0),
+                        "last_post_at": str(last_post) if last_post else None,
+                    }
+                )
         except Exception as e:
             stats.update({"error": str(e)})
         return stats
 
     def get_author_id(self, post_id: int) -> Optional[int]:
-        # from dev data
+        # từ data đã load
         try:
-            row = self.data["post"].loc[self.data["post"]["Id"] == post_id]
+            row = self.data["posts"].loc[self.data["posts"]["Id"] == post_id]
             if not row.empty:
                 return int(row["UserId"].iloc[0])
         except Exception:
@@ -2269,7 +3026,9 @@ class OnlineInferencePipeline:
         try:
             if self.db_session_factory:
                 with self.db_session_factory() as s:
-                    r = s.execute(text("SELECT UserId FROM Post WHERE Id=:pid"), {"pid": post_id}).first()
+                    r = s.execute(
+                        text("SELECT UserId FROM Post WHERE Id=:pid"), {"pid": post_id}
+                    ).first()
                     return int(r[0]) if r else None
         except Exception:
             pass
