@@ -46,10 +46,10 @@ class FollowingRecall(BaseRecall):
             config: Configuration
         """
         super().__init__(redis_client, config)
-        
+        self.r = redis_client
         self.data = data or {}
         self.following_dict = following_dict or {}
-        
+        self.r = redis_client
         # Configuration
         self.recent_hours = self.config.get('recent_hours', 48)
         self.cache_ttl = self.config.get('cache_ttl', 1800)  # 30 minutes
@@ -65,6 +65,9 @@ class FollowingRecall(BaseRecall):
         Returns:
             List of post IDs (sorted by recency)
         """
+        if not self.r:
+            return []
+        
         # Try cache first
         cached = self._get_from_cache_json(user_id)
         if cached is not None:

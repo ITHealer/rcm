@@ -1,54 +1,39 @@
-# ============================================================================
-# OFFLINE TRAINING CONFIGURATION
-# ============================================================================
-# Configuration for offline model training pipeline
+# ======================================================================
+# OFFLINE TRAINING CONFIGURATION  (FULL)
+# ======================================================================
 
-# ============================================================================
-# SYSTEM
-# ============================================================================
 system:
   name: "recommendation-offline-training"
-  version: "1.0.0"
+  version: "1.1.0"
   environment: "development"
   log_level: "INFO"
 
-# ============================================================================
-# DATA
-# ============================================================================
 data:
-  source: "csv"  # csv or database
+  source: "database"          # database | csv
   dir: "dataset"
-  
-  # CSV files
+
+  # CSV (nếu dùng)
   csv_files:
     users: "User.csv"
     posts: "Post.csv"
     reactions: "PostReaction.csv"
     friendships: "Friendship.csv"
-  
-  # Database (if source = "database")
+
+  # Database DSN (Postgres / MySQL)
   database:
-    host: "localhost"
-    port: 5432
-    database: "social_network"
-    user: "postgres"
-    password: "${DB_PASSWORD}"
-  
-  # Data window
-  lookback_days: 14  # Use last 14 days for training
-  chunk_size: 100000  # For memory-efficient processing
-  
-  # Train/val/test split
+    url: "postgresql+psycopg2://postgres:123456@localhost:5551/rcm_db"
+
+  # Khi chạy window (không áp dụng cho full)
+  lookback_days: 14
+  chunk_size: 100000
+
   train_test_split:
-    test_days: 7
-    val_days: 7
+    test_days: 3       # gợi ý: khi data rất mỏng, tạm đặt 1
+    val_days: 3        # gợi ý: khi data rất mỏng, tạm đặt 1
 
-
-
+# Mapping bảng trong DB (nếu cần)
 database:
-  # CHỈNH URL NÀY: mysql+pymysql://USER:PASS@HOST:3306/DBNAME?charset=utf8mb4
-  url: "mysql+pymysql://way_root:YmhNWpppahN92AtJotFDoHnCoW38keDp@14.225.220.56:15479/wayjet_system"
-
+  url: ""
   tables:
     post_view: PostView
     post_reaction: PostReaction
@@ -58,8 +43,6 @@ database:
     post_hashtag: PostHashtag
     friendship: Friendship
     comment: Comment
-
-  # mapping reaction đúng như ảnh DB
   reaction_code_map:
     like: like
     love: love
@@ -78,73 +61,60 @@ database:
     Care: care
 
 training:
-  pretrain_full_export: true   # lần đầu lấy FULL (data bạn ~2 tháng)
-  window_days: 90
-  overlap_days: 2
+  # === LỰA CHỌN CHẾ ĐỘ ===
+  mode: "window"             # full | window | incremental
+  pretrain_full_export: false
+
+  # === WINDOW/INCREMENTAL ===
+  window_days: 14            # enforce TRAIN_WINDOW_DAYS=14 khi mode=window
+  overlap_days: 2            # incremental/window: trừ lùi n ngày chống “đứt quãng”
+  min_train_rows: 1000       # nếu < mức này => cảnh báo/expand window (dev)
+  min_pos_rows: 100
+
+  # === TIME-DECAY ===
   half_life_days: 7
   test_days: 3
   val_days: 3
   chunk_size: 100000
 
-artifacts:
-  base_dir: models
-  state_file: models/training_state.json
-
-# ============================================================================
-# TIME DECAY
-# ============================================================================
-time_decay:
-  enabled: true
-  half_life_days: 7.0  # Interactions lose 50% weight after 7 days
-  min_weight: 0.01     # Minimum weight threshold
-  
-  # Action multipliers
+  # multipliers
+  use_action_multiplier: true
   action_multipliers:
     view: 0.5
     like: 1.0
+    love: 1.3
+    care: 1.25
+    laugh: 1.2
+    wow: 1.1
+    sad: 0.9
+    angry: 0.9
     comment: 1.5
     share: 2.0
     save: 1.2
-    hide: -3.0
-    report: -5.0
 
-# ============================================================================
-# EMBEDDINGS GENERATION
-# ============================================================================
+# EMBEDDINGS / CF / RANKING giữ nguyên như bản của bạn
 embeddings:
   model_name: "sentence-transformers/all-MiniLM-L6-v2"
   embedding_dim: 384
   batch_size: 512
   normalize: true
-  device: "auto"  # auto, cuda, cpu
-  
-  # Post embeddings
+  device: "auto"
   post:
-    update_frequency: "6h"  # Update every 6 hours
-    min_content_length: 10  # Min characters
-  
-  # User embeddings
+    update_frequency: "6h"
+    min_content_length: 10
   user:
-    lookback_days: 14  # Aggregate from last 14 days
-    min_interactions: 5  # Min interactions needed
+    lookback_days: 14
+    min_interactions: 5
     update_frequency: "daily"
 
-# ============================================================================
-# COLLABORATIVE FILTERING
-# ============================================================================
 collaborative_filtering:
   min_interactions: 5
   top_k_similar_users: 50
   top_k_similar_items: 50
   similarity_metric: "cosine"
 
-# ============================================================================
-# RANKING MODEL (LightGBM)
-# ============================================================================
 ranking_model:
   algorithm: "lightgbm"
-  
-  # Hyperparameters
   params:
     boosting_type: "gbdt"
     objective: "binary"
@@ -161,17 +131,10 @@ ranking_model:
     verbose: -1
     n_jobs: -1
     seed: 42
-  
-  # Training
   num_boost_round: 1000
   early_stopping_rounds: 50
-  
-  # Negative sampling
-  negative_sample_ratio: 5  # 5 negative for 1 positive
+  negative_sample_ratio: 5
 
-# ============================================================================
-# FEATURES
-# ============================================================================
 features:
   user_features: 15
   post_features: 18
@@ -179,14 +142,11 @@ features:
   interaction_features: 7
   total_features: 47
 
-# ============================================================================
-# ARTIFACT MANAGEMENT
-# ============================================================================
 artifacts:
   base_dir: "models"
-  keep_versions: 5  # Keep last 5 versions
-  
-  # What to save
+  keep_versions: 5
+  # Watermark & meta để incremental/window
+  state_file: "models/training_state.json"
   save:
     - embeddings
     - cf_model
@@ -199,99 +159,49 @@ artifacts:
     - faiss_index
     - metadata
 
-# ============================================================================
-# TRAINING SCHEDULE
-# ============================================================================
 schedule:
-  # Frequency
-  frequency: "weekly"  # daily, weekly, biweekly
-  
-  # When to run (for weekly)
-  day_of_week: "sunday"  # monday, tuesday, ..., sunday
-  time: "02:00"  # 24h format
-  
-  # Incremental training (Phase 2+)
+  frequency: "weekly"
+  day_of_week: "sunday"
+  time: "02:00"
   incremental:
-    enabled: false  # Enable in Phase 2
-    full_retrain_frequency: "biweekly"  # Full retrain every 2 weeks
+    enabled: true
+    full_retrain_frequency: "biweekly"
 
-# ============================================================================
-# MONITORING & LOGGING
-# ============================================================================
 logging:
   level: "INFO"
   format: "[%(asctime)s] %(levelname)s - %(name)s - %(message)s"
   file: "logs/offline_training.log"
-  max_bytes: 10485760  # 10MB
+  max_bytes: 10485760
   backup_count: 5
 
 monitoring:
   enabled: true
-  metrics:
-    - training_time
-    - model_auc
-    - feature_importance
-    - data_quality
-  
-  # Alerts
+  metrics: [training_time, model_auc, feature_importance, data_quality]
   alerts:
     min_auc: 0.70
     max_training_time_hours: 3
     min_data_size: 10000
 
-# ============================================================================
-# CHECKPOINTS
-# ============================================================================
 checkpoints:
   enabled: true
   dir: "checkpoints"
-  frequency: "hourly"  # Save checkpoint every hour during training
-  keep_last: 3  # Keep last 3 checkpoints
+  frequency: "hourly"
+  keep_last: 3
 
-# ============================================================================
-# OPTIMIZATION
-# ============================================================================
 optimization:
-  # Memory
   low_memory_mode: false
   max_memory_gb: 16
-  
-  # CPU
-  n_jobs: -1  # Use all CPUs
-  
-  # GPU (for embeddings)
-  use_gpu: true  # If available
+  n_jobs: -1
+  use_gpu: true
   gpu_device: 0
 
-# ============================================================================
-# VALIDATION
-# ============================================================================
 validation:
   enabled: true
-  
-  # Metrics to track
-  metrics:
-    - auc
-    - precision@10
-    - recall@10
-    - ndcg@10
-    - map@10
-  
-  # Model selection
+  metrics: [auc, precision@10, recall@10, ndcg@10, map@10]
   primary_metric: "auc"
-  minimize: false  # False = maximize
+  minimize: false
 
-# ============================================================================
-# EXPORT
-# ============================================================================
 export:
-  # Export for online serving
-  online_artifacts:
-    - embeddings
-    - cf_similarities
-    - ranking_model
-    - feature_metadata
-  
-  # Format
-  format: "pickle"  # pickle, onnx
+  online_artifacts: [embeddings, cf_similarities, ranking_model, feature_metadata]
+  format: "pickle"
   compression: true
