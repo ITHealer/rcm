@@ -6,5 +6,6 @@ models/
 *.sql
 pgdata/
 *.pyc
+__pycache__/
 configs/
 ./configs/
