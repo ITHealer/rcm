@@ -92,6 +92,7 @@ class RecommendationService:
         
         # Build following dict
         following_dict = {}
+        print(f"Building following dict...{self.data}")
         if 'friendships' in self.data:
             friendships = self.data['friendships']
             for user_id, group in friendships.groupby('UserId'):

@@ -75,7 +75,8 @@ class Settings(BaseSettings):
     # ==================== MODEL PATHS ====================
     
     # Offline model paths (read-only)
-    OFFLINE_PATH: str = os.getenv("OFFLINE_PATH", "../offline")
+    OFFLINE_PATH: str = "configs"
+    # OFFLINE_PATH2: str = os.getenv("OFFLINE_PATH", "../offline")
     
     MODEL_PATH: str = ""  # Will be set dynamically from latest version
     MODEL_VERSION: str = "latest"
