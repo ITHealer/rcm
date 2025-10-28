@@ -148,6 +148,9 @@ def build_training_matrices(
     embeddings: Optional[Dict[str, Dict[int, np.ndarray]]] = None,
     now_ts: Optional[datetime] = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, dict]:
+    """
+    Build training matrices with enhanced features
+    """
     if interactions is None or interactions.empty:
         raise ValueError("interactions is empty")
 
@@ -158,7 +161,7 @@ def build_training_matrices(
     if "label" not in df.columns:
         df["label"] = df["action"].isin(POSITIVE_ACTIONS).astype(int)
 
-    # user stats
+    # User stats
     u_cnt = df.groupby("user_id").size().rename("user_total_interactions")
     u_pos = df.groupby("user_id")["label"].mean().rename("user_positive_rate")
     u = pd.concat([u_cnt, u_pos], axis=1).reset_index()
@@ -174,32 +177,60 @@ def build_training_matrices(
         df["user_account_age_days"] = age_days.fillna(0.0).clip(lower=0.0)
         df.drop(columns=["user_created_at"], inplace=True)
 
-    # post stats
+    # Post stats
     p_cnt = df.groupby("post_id").size().rename("post_total_interactions")
     p_pos = df.groupby("post_id")["label"].mean().rename("post_positive_rate")
     p = pd.concat([p_cnt, p_pos], axis=1).reset_index()
     df = df.merge(p, on="post_id", how="left")
 
-    # posts meta
+    # Posts meta
     df["post_age_hours"] = 0.0
     df["post_is_repost"] = 0.0
     df["post_is_pin"] = 0.0
     df["author_id_known"] = 0.0
+    
     if isinstance(posts_df, pd.DataFrame) and {"Id", "UserId", "CreateDate"}.issubset(posts_df.columns):
-        pp = posts_df[["Id", "UserId", "CreateDate", "IsRepost", "IsPin"]].rename(
-            columns={"Id": "post_id", "UserId": "author_id", "CreateDate": "post_created_at"}
-        ).copy()
+        pp = posts_df[["Id", "UserId", "CreateDate"]].copy()
+        
+        if "IsRepost" in posts_df.columns:
+            pp["IsRepost"] = posts_df["IsRepost"]
+        else:
+            pp["IsRepost"] = 0
+            
+        if "IsPin" in posts_df.columns:
+            pp["IsPin"] = posts_df["IsPin"]
+        else:
+            pp["IsPin"] = 0
+        
+        pp.rename(columns={
+            "Id": "post_id",
+            "UserId": "author_id_from_posts",
+            "CreateDate": "post_created_at"
+        }, inplace=True)
+        
         pp["post_created_at"] = _ensure_datetime_utc(pp["post_created_at"])
         base = now_ts or _now_utc()
+        
         df = df.merge(pp, on="post_id", how="left")
+        
+        if "author_id" not in df.columns:
+            df["author_id"] = df["author_id_from_posts"]
+        else:
+            df["author_id"] = df["author_id"].fillna(df["author_id_from_posts"])
+        
+        df.drop(columns=["author_id_from_posts"], inplace=True, errors='ignore')
+        
         df["author_id_known"] = df["author_id"].notnull().astype(float)
         age_h = (base - df["post_created_at"]).dt.total_seconds() / 3600.0
         df["post_age_hours"] = age_h.fillna(0.0).clip(lower=0.0)
         df["post_is_repost"] = df["IsRepost"].fillna(0).astype(float)
         df["post_is_pin"] = df["IsPin"].fillna(0).astype(float)
         df.drop(columns=["post_created_at", "IsRepost", "IsPin"], inplace=True)
+    else:
+        if "author_id" in df.columns:
+            df["author_id_known"] = df["author_id"].notnull().astype(float)
 
-    # hashtag count
+    # Hashtag count
     if isinstance(post_hashtags_df, pd.DataFrame) and "PostId" in post_hashtags_df.columns:
         hcnt = (
             post_hashtags_df.groupby("PostId")
@@ -214,7 +245,7 @@ def build_training_matrices(
     else:
         df["post_hashtag_count"] = 0.0
 
-    # author stats + follower_count + is_following
+    # Author stats
     df["author_total_interactions"] = 0.0
     df["author_positive_rate"] = 0.0
     df["author_follower_count"] = 0.0
@@ -260,7 +291,7 @@ def build_training_matrices(
     df["author_follower_count"] = df["author_follower_count"].fillna(0.0)
     df["is_following_author"] = df["is_following_author"].fillna(0.0)
 
-    # embeddings similarity (optional)
+    # Embeddings similarity
     df["user_post_cosine"] = 0.0
     if embeddings and isinstance(embeddings.get("post"), dict):
         post_vecs = embeddings["post"]
@@ -277,6 +308,27 @@ def build_training_matrices(
             sims.append(float(np.dot(pv, uv) / (na * nb)) if (na > 0 and nb > 0) else 0.0)
         df["user_post_cosine"] = sims
 
+    # ✅ NEW: Advanced features
+    df['user_post_ratio'] = df['post_total_interactions'] / (df['user_total_interactions'] + 1e-6)
+    df['author_user_ratio'] = df['author_total_interactions'] / (df['user_total_interactions'] + 1e-6)
+    
+    df['post_age_days'] = df['post_age_hours'] / 24.0
+    df['post_is_fresh'] = (df['post_age_hours'] < 24).astype(float)
+    df['post_is_hot'] = (df['post_age_hours'] < 6).astype(float)
+    
+    df['post_engagement_rate'] = df['post_positive_rate'] * df['post_total_interactions']
+    df['author_engagement_rate'] = df['author_positive_rate'] * df['author_total_interactions']
+    
+    df['following_x_engagement'] = df['is_following_author'] * df['post_engagement_rate']
+    df['similarity_x_engagement'] = df['user_post_cosine'] * df['post_engagement_rate']
+    
+    df['user_is_active'] = (df['user_total_interactions'] >= 10).astype(float)
+    df['user_is_super_active'] = (df['user_total_interactions'] >= 50).astype(float)
+    
+    df['post_is_popular'] = (df['post_total_interactions'] >= 10).astype(float)
+    df['post_is_viral'] = (df['post_total_interactions'] >= 50).astype(float)
+
+    # Feature columns list
     feature_cols = [
         "user_total_interactions", "user_positive_rate", "user_account_age_days",
         "post_total_interactions", "post_positive_rate", "post_age_hours",
@@ -284,7 +336,14 @@ def build_training_matrices(
         "author_id_known", "author_total_interactions", "author_positive_rate",
         "author_follower_count", "is_following_author",
         "user_post_cosine",
+        "user_post_ratio", "author_user_ratio",
+        "post_age_days", "post_is_fresh", "post_is_hot",
+        "post_engagement_rate", "author_engagement_rate",
+        "following_x_engagement", "similarity_x_engagement",
+        "user_is_active", "user_is_super_active",
+        "post_is_popular", "post_is_viral"
     ]
+    
     for c in feature_cols:
         if c not in df.columns:
             df[c] = 0.0

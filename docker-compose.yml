@@ -1,52 +1,144 @@
 version: '3.8'
 
 services:
-  postgres:
-    image: postgres:16
-    container_name: pg16
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: 123456
-    ports:
-      - "5551:5432"        # map cổng máy bạn 5551 -> cổng trong container 5432
-    volumes:
-      - ./pgdata:/var/lib/postgresql/data
-
+  # Redis Cache Service
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
+    container_name: recommendation_redis
     ports:
-      - "6381:6379"
+      - "6379:6379"
     volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
+      - redis-data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+    networks:
+      - recommendation-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
-  offline:
+  # FastAPI Application
+  api:
     build:
       context: .
-      dockerfile: docker/Dockerfile.offline
-    volumes:
-      - ./dataset:/app/dataset
-      - ./models:/app/models
-    depends_on:
-      - redis
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-
-  online:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.online
+      dockerfile: Dockerfile
+    container_name: recommendation_api
     ports:
       - "8000:8000"
-    volumes:
-      - ./models:/app/models
-    depends_on:
-      - redis
-      - offline
     environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - HOST=0.0.0.0
+      - PORT=8000
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=
+      - LOG_LEVEL=INFO
+      - OFFLINE_PATH=/app/offline
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      # Mount toàn bộ project root
+      - .:/app:ro
+      
+      # Mount logs directory (read-write)
+      - ./logs:/app/logs
+    networks:
+      - recommendation-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    command: >
+      uvicorn recommender.online.app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --log-level info
+
+  # Redis Commander (Web UI for Redis)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: recommendation_redis_commander
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - recommendation-network
+    restart: unless-stopped
 
 volumes:
-  redis_data:
+  redis-data:
+    driver: local
+
+networks:
+  recommendation-network:
+    driver: bridge
+
+# version: '3.8'
+
+# services:
+#   postgres:
+#     image: postgres:16
+#     container_name: pg16
+#     environment:
+#       POSTGRES_USER: postgres
+#       POSTGRES_PASSWORD: 123456
+#     ports:
+#       - "5551:5432"        # map cổng máy bạn 5551 -> cổng trong container 5432
+#     volumes:
+#       - ./pgdata:/var/lib/postgresql/data
+
+#   redis:
+#     image: redis:7-alpine
+#     ports:
+#       - "6381:6379"
+#     volumes:
+#       - redis_data:/data
+#     command: redis-server --appendonly yes
+
+#   offline:
+#     build:
+#       context: .
+#       dockerfile: docker/Dockerfile.offline
+#     volumes:
+#       - ./dataset:/app/dataset
+#       - ./models:/app/models
+#     depends_on:
+#       - redis
+#     environment:
+#       - REDIS_HOST=redis
+#       - REDIS_PORT=6379
+
+#   online:
+#     build:
+#       context: .
+#       dockerfile: docker/Dockerfile.online
+#     ports:
+#       - "8000:8000"
+#     volumes:
+#       - ./models:/app/models
+#     depends_on:
+#       - redis
+#       - offline
+#     environment:
+#       - REDIS_HOST=redis
+#       - REDIS_PORT=6379
+
+# volumes:
+#   redis_data:
