@@ -63,8 +63,29 @@ class FeatureEngineer:
         if isinstance(self.posts, pd.DataFrame) and {"Id", "UserId"}.issubset(self.posts.columns):
             self.post_author = dict(zip(self.posts["Id"].astype(int), self.posts["UserId"].astype(int)))
 
-        self.post_is_repost = dict(zip(self.posts["Id"], self.posts.get("IsRepost", 0))) if isinstance(self.posts, pd.DataFrame) and "Id" in self.posts.columns else {}
-        self.post_is_pin = dict(zip(self.posts["Id"], self.posts.get("IsPin", 0))) if isinstance(self.posts, pd.DataFrame) and "Id" in self.posts.columns else {}
+        self.post_is_repost: Dict[int, int] = {}
+        self.post_is_pin: Dict[int, int] = {}
+        if isinstance(self.posts, pd.DataFrame) and "Id" in self.posts.columns:
+            ids = self.posts["Id"].astype(int)
+
+            # Lấy series nếu có, nếu không tạo series mặc định độ dài đúng bằng số dòng
+            if "IsRepost" in self.posts.columns:
+                is_repost_series = pd.to_numeric(self.posts["IsRepost"], errors="coerce").fillna(0)
+            else:
+                is_repost_series = pd.Series(0, index=self.posts.index)
+
+            if "IsPin" in self.posts.columns:
+                is_pin_series = pd.to_numeric(self.posts["IsPin"], errors="coerce").fillna(0)
+            else:
+                is_pin_series = pd.Series(0, index=self.posts.index)
+
+            # Ép kiểu int (0/1) và build dict
+            self.post_is_repost = dict(zip(ids, is_repost_series.astype(int)))
+            self.post_is_pin = dict(zip(ids, is_pin_series.astype(int)))
+        else:
+            self.post_is_repost = {}
+            self.post_is_pin = {}
+            
         self.post_created = {}
         if isinstance(self.posts, pd.DataFrame) and "CreateDate" in self.posts.columns:
             tmp = self.posts[["Id", "CreateDate"]].copy()

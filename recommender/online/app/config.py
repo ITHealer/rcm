@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     # ==================== REDIS CONFIGURATION ====================
     
     # Redis Connection
-    REDIS_HOST: str = "localhost"
+    REDIS_HOST: str = "recommendation_redis"
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
     REDIS_PASSWORD: str = ""
@@ -200,11 +200,16 @@ class Settings(BaseSettings):
     
     # MySQL connection for Team App (NOT used by AI team directly)
     # These are here for reference only
-    MYSQL_HOST: str = "localhost"
-    MYSQL_PORT: int = 3306
-    MYSQL_DATABASE: str = "social_network"
-    MYSQL_USER: str = "app_user"
-    MYSQL_PASSWORD: str = ""
+    # MYSQL_HOST: str = "localhost"
+    # MYSQL_PORT: int = 3306
+    # MYSQL_DATABASE: str = "social_network"
+    # MYSQL_USER: str = "app_user"
+    # MYSQL_PASSWORD: str = ""
+    MYSQL_HOST: str = "14.225.220.56"            # thay "ip" bằng địa chỉ IP thực tế
+    MYSQL_PORT: int = 15479
+    MYSQL_DATABASE: str = "wayjet_system"
+    MYSQL_USER: str = "way_root"
+    MYSQL_PASSWORD: str = "YmhNWpppahN92AtJotFDoHnCoW38keDp"
     
     # Sync intervals (for Team App scripts)
     SYNC_INTERVAL_SECONDS: int = 60  # Sync every minute

@@ -115,7 +115,7 @@ async def get_feed(
     
     # Generate feed
     try:
-        result = recommendation_service.generate_feed(
+        result = recommendation_service.get_feed(
             user_id=user_id,
             limit=limit,
             exclude_seen=exclude_list
