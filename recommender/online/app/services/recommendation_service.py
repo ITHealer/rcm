@@ -530,54 +530,84 @@ class RecommendationService:
     
     # ==================== RECOMMENDATION METHODS ====================
     
-    def get_feed(
-        self,
-        user_id: int,
-        limit: int = 50,
-        exclude_seen: Optional[List[int]] = None
-    ) -> List[Dict[str, Any]]:
+    # def get_feed(
+    #     self,
+    #     user_id: int,
+    #     limit: int = 50,
+    #     exclude_seen: Optional[List[int]] = None
+    # ) -> List[Dict[str, Any]]:
+    #     """
+    #     Get personalized feed for user
+        
+    #     Args:
+    #         user_id: User ID
+    #         limit: Number of posts to return
+    #         exclude_seen: Post IDs to exclude
+        
+    #     Returns:
+    #         List of recommended posts
+    #     """
+    #     try:
+    #         logger.info(f"📰 Getting feed for user {user_id}, limit={limit}")
+            
+    #         # 1. Recall from multiple channels
+    #         candidates = self._recall_candidates(user_id, target=1000)
+            
+    #         if not candidates:
+    #             logger.warning(f"No candidates for user {user_id}")
+    #             return []
+            
+    #         logger.info(f"   Recalled {len(candidates)} candidates")
+            
+    #         # 2. Filter seen posts
+    #         if exclude_seen:
+    #             candidates = [c for c in candidates if c['post_id'] not in exclude_seen]
+    #             logger.info(f"   After filtering seen: {len(candidates)} candidates")
+            
+    #         # 3. Rank candidates
+    #         ranked = self._rank_candidates(user_id, candidates)
+            
+    #         # 4. Diversify and return top-K
+    #         final_feed = ranked[:limit]
+            
+    #         logger.info(f"✅ Returning {len(final_feed)} posts for user {user_id}")
+            
+    #         return final_feed
+            
+    #     except Exception as e:
+    #         logger.error(f"Error getting feed for user {user_id}: {e}", exc_info=True)
+    #         return []
+    def get_feed(self, user_id: int, limit: int = 50):
         """
         Get personalized feed for user
         
-        Args:
-            user_id: User ID
-            limit: Number of posts to return
-            exclude_seen: Post IDs to exclude
-        
         Returns:
-            List of recommended posts
+            dict: {
+                "posts": List[dict],
+                "count": int,
+                "user_id": int
+            }
         """
-        try:
-            logger.info(f"📰 Getting feed for user {user_id}, limit={limit}")
-            
-            # 1. Recall from multiple channels
-            candidates = self._recall_candidates(user_id, target=1000)
-            
-            if not candidates:
-                logger.warning(f"No candidates for user {user_id}")
-                return []
-            
-            logger.info(f"   Recalled {len(candidates)} candidates")
-            
-            # 2. Filter seen posts
-            if exclude_seen:
-                candidates = [c for c in candidates if c['post_id'] not in exclude_seen]
-                logger.info(f"   After filtering seen: {len(candidates)} candidates")
-            
-            # 3. Rank candidates
-            ranked = self._rank_candidates(user_id, candidates)
-            
-            # 4. Diversify and return top-K
-            final_feed = ranked[:limit]
-            
-            logger.info(f"✅ Returning {len(final_feed)} posts for user {user_id}")
-            
-            return final_feed
-            
-        except Exception as e:
-            logger.error(f"Error getting feed for user {user_id}: {e}", exc_info=True)
-            return []
-    
+        candidates = self._recall_candidates(user_id)
+        
+        if not candidates:
+            logger.warning(f"No candidates for user {user_id}")
+            # ✅ FIX: Trả về dictionary thay vì empty list
+            return {
+                "posts": [],
+                "count": 0,
+                "user_id": user_id
+            }
+        
+        # Ranking và trả về feed
+        ranked_posts = self._rank_and_filter(candidates, limit)
+        
+        return {
+            "posts": ranked_posts,
+            "count": len(ranked_posts),
+            "user_id": user_id
+        }
+        
     def _recall_candidates(
         self,
         user_id: int,
@@ -783,4 +813,4 @@ def normalize_column_names(df: pd.DataFrame, table_name: str = "") -> pd.DataFra
         df_normalized.rename(columns=rename_dict, inplace=True)
         logger.debug(f"Normalized {len(rename_dict)} columns in {table_name}")
     
-    return df_normalized
+    return df_normalized    
